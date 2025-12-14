@@ -149,5 +149,67 @@ object PsiMapper {
     private fun isWordCharacter(c: Char): Boolean {
         return c.isLetterOrDigit() || c == '_'
     }
+
+    /**
+     * Get PsiFile from URI string.
+     */
+    fun getPsiFile(project: com.intellij.openapi.project.Project, uri: String): PsiFile? {
+        return ReadAction.compute<PsiFile?, RuntimeException> {
+            try {
+                val path = java.net.URI(uri).path
+                val virtualFile = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+                    .findFileByPath(path) ?: return@compute null
+                com.intellij.psi.PsiManager.getInstance(project).findFile(virtualFile)
+            } catch (e: Exception) {
+                log.warn("Failed to get PSI file for URI: $uri", e)
+                null
+            }
+        }
+    }
+
+    /**
+     * Get Document from PsiFile.
+     */
+    fun getDocument(psiFile: PsiFile): Document? {
+        return ReadAction.compute<Document?, RuntimeException> {
+            val virtualFile = psiFile.virtualFile ?: return@compute null
+            com.intellij.openapi.fileEditor.FileDocumentManager.getInstance()
+                .getDocument(virtualFile)
+        }
+    }
+
+    /**
+     * Convert PsiElement to LSP Range within a file.
+     */
+    fun elementToRange(element: PsiElement, psiFile: PsiFile): Range {
+        val document = getDocument(psiFile)
+        if (document == null) {
+            return Range(Position(0, 0), Position(0, 0))
+        }
+        val textRange = element.textRange
+        if (textRange == null) {
+            return Range(Position(0, 0), Position(0, 0))
+        }
+        // Calculate directly without a ReadAction wrapper; callers must invoke this inside a ReadAction.
+        val startLine = document.getLineNumber(textRange.startOffset)
+        val startLineStart = document.getLineStartOffset(startLine)
+        val startChar = textRange.startOffset - startLineStart
+        
+        val endLine = document.getLineNumber(textRange.endOffset)
+        val endLineStart = document.getLineStartOffset(endLine)
+        val endChar = textRange.endOffset - endLineStart
+        
+        return Range(
+            Position(startLine, startChar),
+            Position(endLine, endChar)
+        )
+    }
+
+    /**
+     * Convert PsiElement to LSP Location (alias for psiElementToLocation).
+     */
+    fun elementToLocation(element: PsiElement): Location? {
+        return psiElementToLocation(element)
+    }
 }
 

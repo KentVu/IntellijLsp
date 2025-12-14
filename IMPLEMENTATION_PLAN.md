@@ -27,12 +27,18 @@ src/main/kotlin/com/frenchef/intellijlsp/
 │   ├── HoverHandler.kt                 # textDocument/hover
 │   ├── DefinitionHandler.kt            # textDocument/definition
 │   ├── ReferencesHandler.kt            # textDocument/references
-│   └── DiagnosticsHandler.kt           # publishDiagnostics
+│   ├── DocumentHighlightHandler.kt     # textDocument/documentHighlight
+│   ├── DiagnosticsHandler.kt           # publishDiagnostics
+│   ├── TypeDefinitionHandler.kt        # textDocument/typeDefinition
+│   ├── DocumentSymbolHandler.kt        # textDocument/documentSymbol
+│   └── SemanticTokensHandler.kt        # textDocument/semanticTokens/*
 ├── intellij/
 │   ├── DocumentManager.kt              # Document synchronization with IntelliJ
 │   ├── PsiMapper.kt                    # Map PSI elements to LSP types
 │   ├── DiagnosticsProvider.kt          # Extract diagnostics from IntelliJ
-│   └── CompletionProvider.kt           # Bridge to IntelliJ completion
+│   ├── CompletionProvider.kt           # Bridge to IntelliJ completion
+│   ├── DocumentSymbolProvider.kt       # Extract document symbols from IntelliJ
+│   └── SemanticTokensProvider.kt       # Semantic tokens (full/range)
 ├── config/
 │   ├── LspSettings.kt                  # Plugin settings state
 │   ├── LspConfigurable.kt              # Settings UI
@@ -51,11 +57,11 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Configure build dependencies and plugin structure
 
 **Tasks**:
-- [ ] Update `build.gradle.kts`:
+- [x] Update `build.gradle.kts`:
   - Add Kotlin coroutines dependency
   - Add any required serialization libraries (or use IntelliJ's built-in Gson)
   - Configure plugin dependencies
-- [ ] Update `plugin.xml`:
+- [x] Update `plugin.xml`:
   - Define project service: `LspProjectService`
   - Register startup activity: `LspServerStartupActivity`
   - Register settings: `LspConfigurable`
@@ -70,16 +76,16 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Create settings infrastructure
 
 **Tasks**:
-- [ ] Create `TransportMode` enum (TCP/UDS)
-- [ ] Create `LspSettings` with persistent state:
+- [x] Create `TransportMode` enum (TCP/UDS)
+- [x] Create `LspSettings` with persistent state:
   - Transport mode
   - Starting port (default 2087)
   - Auto-start enabled
-- [ ] Create `LspConfigurable` for settings UI:
+- [x] Create `LspConfigurable` for settings UI:
   - Radio buttons for transport mode
   - Number field for starting port
   - Display current server status
-- [ ] Create `PortAllocator` singleton:
+- [x] Create `PortAllocator` singleton:
   - Track allocated ports across all projects
   - Find next available port starting from configured port
 
@@ -93,20 +99,20 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Implement JSON-RPC 2.0 message handling
 
 **Tasks**:
-- [ ] Create `MessageReader`:
+- [x] Create `MessageReader`:
   - Parse Content-Length header
   - Read JSON payload
   - Handle malformed messages
-- [ ] Create `MessageWriter`:
+- [x] Create `MessageWriter`:
   - Format messages with Content-Length header
   - Serialize JSON responses
   - Buffer management
-- [ ] Create LSP data models:
+- [x] Create LSP data models:
   - `LspRequest` (id, method, params)
   - `LspResponse` (id, result, error)
   - `LspNotification` (method, params)
   - Common LSP types (Position, Range, TextDocumentIdentifier, etc.)
-- [ ] Create `JsonRpcHandler`:
+- [x] Create `JsonRpcHandler`:
   - Route requests to appropriate handlers
   - Handle errors and generate error responses
   - Support batch requests
@@ -126,11 +132,11 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Create TCP-based LSP server
 
 **Tasks**:
-- [ ] Create `LspServer` interface:
+- [x] Create `LspServer` interface:
   - `start()`, `stop()`, `isRunning()`
   - `getPort()` or `getSocketPath()`
   - `onClientConnected()`, `onClientDisconnected()`
-- [ ] Create `TcpLspServer`:
+- [x] Create `TcpLspServer`:
   - Bind to localhost on allocated port
   - Accept client connections
   - Handle multiple concurrent clients
@@ -146,7 +152,7 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Create UDS-based LSP server
 
 **Tasks**:
-- [ ] Create `UdsLspServer`:
+- [x] Create `UdsLspServer`:
   - Create socket file in `~/.intellij-lsp/`
   - Set proper permissions (0600)
   - Accept client connections
@@ -160,20 +166,20 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Manage server per project lifecycle
 
 **Tasks**:
-- [ ] Create `LspServerManager`:
+- [x] Create `LspServerManager`:
   - Factory method to create server based on transport mode
   - Start server with error handling
   - Stop server and cleanup resources
-- [ ] Create `LspProjectService`:
+- [x] Create `LspProjectService`:
   - Project-level service
   - Hold reference to `LspServer` instance
   - Expose server status
   - Implement `Disposable` for cleanup
-- [ ] Create startup activity:
+- [x] Create startup activity:
   - Implement `StartupActivity` or `ProjectActivity`
   - Start LSP server when project opens
   - Log server status and port/socket path
-- [ ] Create project close listener:
+- [x] Create project close listener (or rely on `Disposable` cleanup):
   - Stop server when project closes
   - Release port allocation
   - Clean up resources
@@ -189,7 +195,7 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Implement initialize, initialized, shutdown, exit
 
 **Tasks**:
-- [ ] Create `LifecycleHandler`:
+- [x] Create `LifecycleHandler`:
   - Handle `initialize` request:
     - Parse client capabilities
     - Return server capabilities
@@ -206,12 +212,39 @@ src/main/kotlin/com/frenchef/intellijlsp/
 - `textDocumentSync`: Incremental
 - `hoverProvider`: true
 - `definitionProvider`: true
+- `typeDefinitionProvider`: true (required by abcoder)
 - `completionProvider`: with trigger characters
 - `referencesProvider`: true
-- `diagnosticProvider`: workspace diagnostics
+- `documentHighlightProvider`: true
+- `documentSymbolProvider`: true (required by abcoder)
+- `semanticTokensProvider`: legend (tokenTypes/tokenModifiers required); range is optional but recommended (required by abcoder)
 
 **Files to create**:
 - `handlers/LifecycleHandler.kt`
+
+### 3.2 abcoder (UniAST) Compatibility (Required)
+**Goal**: Satisfy abcoder's strict capability checks during `initialize` to avoid initialization failures.
+
+**Minimum feature set required by abcoder's strict checks (current project status)**:
+- [x] `initialize` / `initialized`
+- [x] `textDocument/didOpen`
+- [x] `textDocument/definition`
+- [ ] `textDocument/typeDefinition`
+- [ ] `textDocument/documentSymbol`
+- [ ] `textDocument/semanticTokens/full`
+- [ ] `textDocument/semanticTokens/range`
+- [x] `textDocument/references`
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `ServerCapabilities.typeDefinitionProvider`
+  - Add `ServerCapabilities.semanticTokensProvider` (with `legend.tokenTypes`/`legend.tokenModifiers`)
+  - Add DocumentSymbol-related models and parameters (`DocumentSymbol`/`SymbolKind`/`DocumentSymbolParams`, etc.)
+  - Add SemanticTokens-related models and parameters (`SemanticTokens`/`SemanticTokensLegend`/`SemanticTokensParams`/`SemanticTokensRangeParams`, etc.)
+- [ ] Update `LifecycleHandler.getServerCapabilities()`:
+  - Advertise `documentSymbolProvider = true`
+  - Advertise `typeDefinitionProvider = true`
+  - Advertise `semanticTokensProvider` (legend is required; range support is recommended)
 
 ## Phase 4: Document Synchronization
 
@@ -219,7 +252,7 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Synchronize documents between LSP client and IntelliJ
 
 **Tasks**:
-- [ ] Create `DocumentManager`:
+- [x] Create `DocumentManager`:
   - Maintain map of URI → Document version
   - Open document: Store URI and initial content
   - Track document versions
@@ -234,7 +267,7 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Implement didOpen, didChange, didClose, didSave
 
 **Tasks**:
-- [ ] Create `DocumentSyncHandler`:
+- [x] Create `DocumentSyncHandler`:
   - Handle `textDocument/didOpen`:
     - Register document with `DocumentManager`
     - Load or create PSI file in IntelliJ
@@ -260,11 +293,11 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Implement textDocument/hover
 
 **Tasks**:
-- [ ] Create `PsiMapper`:
+- [x] Create `PsiMapper`:
   - Convert LSP Position to IntelliJ offset
   - Convert IntelliJ ranges to LSP ranges
   - URI ↔ VirtualFile conversion
-- [ ] Create `HoverHandler`:
+- [x] Create `HoverHandler`:
   - Get PSI element at position
   - Use `DocumentationProvider` to get documentation
   - Extract quick info (type, signature)
@@ -279,7 +312,7 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Implement textDocument/definition
 
 **Tasks**:
-- [ ] Create `DefinitionHandler`:
+- [x] Create `DefinitionHandler`:
   - Get PSI element at position
   - Resolve references using `PsiReference`
   - Get target element location
@@ -293,12 +326,12 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Implement textDocument/completion
 
 **Tasks**:
-- [ ] Create `CompletionProvider`:
+- [x] Create `CompletionProvider`:
   - Bridge to IntelliJ's `CompletionService`
   - Invoke completion at position
   - Extract completion items
   - Map to LSP CompletionItem
-- [ ] Create `CompletionHandler`:
+- [x] Create `CompletionHandler`:
   - Handle `textDocument/completion` request
   - Use `CompletionProvider`
   - Return CompletionList or CompletionItem[]
@@ -312,7 +345,7 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Implement textDocument/references
 
 **Tasks**:
-- [ ] Create `ReferencesHandler`:
+- [x] Create `ReferencesHandler`:
   - Get PSI element at position
   - Use `ReferencesSearch` to find usages
   - Collect all references
@@ -322,13 +355,86 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Files to create**:
 - `handlers/ReferencesHandler.kt`
 
+### 5.5 Document Highlight
+**Goal**: Implement textDocument/documentHighlight
+
+**Tasks**:
+- [x] Create `DocumentHighlightHandler`:
+  - Get PSI element at position
+  - Resolve reference target when possible
+  - Search references in current file (LocalSearchScope)
+  - Convert to LSP `DocumentHighlight[]`
+
+**Files to create**:
+- `handlers/DocumentHighlightHandler.kt`
+
+### 5.6 Type Definition (Required by abcoder)
+**Goal**: Implement textDocument/typeDefinition
+
+**Tasks**:
+- [ ] Create `TypeDefinitionHandler`:
+  - Get PSI element at position
+  - Resolve the symbol's type and navigate to its type definition (prefer reusing IntelliJ's existing *Go to Type Declaration* logic).
+  - Convert to LSP Location / Location[]
+  - Handle multiple targets (e.g. type aliases or multiple upper bounds).
+- [ ] Register handler in startup:
+  - Create and `register()` `TypeDefinitionHandler` in `LspServerStartupActivity`.
+
+**Implementation Notes**:
+- Prefer IntelliJ platform navigation/resolution capabilities over implementing a type system parser to ensure cross-language/framework compatibility.
+- If the navigation API requires an `Editor`, create a temporary one from `DocumentManager.getIntellijDocument()` and ensure it is disposed.
+
+**Files to create**:
+- `handlers/TypeDefinitionHandler.kt`
+
+### 5.7 Document Symbols (Required by abcoder)
+**Goal**: Implement textDocument/documentSymbol
+
+**Tasks**:
+- [ ] Create `DocumentSymbolProvider`:
+  - Generate a hierarchical `DocumentSymbol` tree from the IntelliJ structure view/PSI.
+  - Generate `range` and `selectionRange` (prefer the TextRange of nameIdentifier).
+  - Fall back to a flat list for languages that do not support the structure view.
+- [ ] Create `DocumentSymbolHandler`:
+  - Handle `textDocument/documentSymbol`
+  - Convert to LSP `DocumentSymbol[]` (or return `SymbolInformation[]` for compatibility).
+- [ ] Register handler in startup:
+  - Create `DocumentSymbolProvider` in `LspServerStartupActivity` and inject it into `DocumentSymbolHandler`.
+  - Call `DocumentSymbolHandler.register()`.
+
+**Files to create**:
+- `intellij/DocumentSymbolProvider.kt`
+- `handlers/DocumentSymbolHandler.kt`
+
+### 5.8 Semantic Tokens (Required by abcoder)
+**Goal**: Implement textDocument/semanticTokens/full + textDocument/semanticTokens/range
+
+**Tasks**:
+- [ ] Define a stable `SemanticTokensLegend`:
+  - `tokenTypes`: Use a subset of standard LSP token types to maintain consistency across languages.
+  - `tokenModifiers`: Use common modifiers (`declaration`/`definition`/`readonly`, etc.).
+- [ ] Create `SemanticTokensProvider`:
+  - Generate tokens on a best-effort basis using the IntelliJ lexer/highlighter and PSI.
+  - Cache full tokens by document version and support slicing by range.
+  - Return `data: IntArray` using LSP delta encoding.
+- [ ] Create `SemanticTokensHandler`:
+  - Handle `textDocument/semanticTokens/full`
+  - Handle `textDocument/semanticTokens/range`
+- [ ] Register handler in startup:
+  - Create `SemanticTokensProvider` in `LspServerStartupActivity` and inject it into `SemanticTokensHandler`.
+  - Call `SemanticTokensHandler.register()`.
+
+**Files to create**:
+- `intellij/SemanticTokensProvider.kt`
+- `handlers/SemanticTokensHandler.kt`
+
 ## Phase 6: Diagnostics
 
 ### 6.1 Diagnostics Provider
 **Goal**: Extract diagnostics from IntelliJ
 
 **Tasks**:
-- [ ] Create `DiagnosticsProvider`:
+- [x] Create `DiagnosticsProvider`:
   - Subscribe to `DaemonCodeAnalyzer` updates
   - Query `WolfTheProblemSolver` for problems
   - Extract `HighlightInfo` for file
@@ -342,7 +448,7 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Publish diagnostics to client
 
 **Tasks**:
-- [ ] Create `DiagnosticsHandler`:
+- [x] Create `DiagnosticsHandler`:
   - Listen to file analysis completion
   - Get diagnostics from `DiagnosticsProvider`
   - Send `textDocument/publishDiagnostics` notification
@@ -358,7 +464,7 @@ src/main/kotlin/com/frenchef/intellijlsp/
 **Goal**: Display server status in IntelliJ
 
 **Tasks**:
-- [ ] Create `LspStatusWidget`:
+- [x] Create `LspStatusWidget`:
   - Implement `StatusBarWidget`
   - Display server state (Running/Stopped)
   - Show port number (TCP mode)
@@ -475,20 +581,290 @@ dependencies {
 ## Future Enhancements (Post-MVP)
 
 ### Phase 9: Extended Features
-- Workspace symbol search
-- Code formatting
-- Code actions (quick fixes)
-- Semantic tokens
-- Signature help
-- Inlay hints
+
+#### 9.1 Workspace Symbols（`workspace/symbol`）
+**Goal**: Implement workspace-wide symbol search
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `WorkspaceSymbolParams` (including `query`, etc.).
+  - Add models for `SymbolInformation` (or `WorkspaceSymbol`).
+- [ ] Update `LifecycleHandler.getServerCapabilities()`:
+  - Advertise `workspaceSymbolProvider = true`
+- [ ] Create `WorkspaceSymbolProvider`:
+  - Search for symbols by `query` using IntelliJ indexing/search capabilities (best-effort).
+  - Map results to LSP `SymbolInformation` (`name/kind/location/containerName`).
+  - Limit the number of results and support cancellation to avoid hanging on full-project scans.
+- [ ] Create `WorkspaceSymbolHandler`:
+  - Handle `workspace/symbol`
+  - Return `SymbolInformation[]` (prefer the most compatible return type).
+- [ ] Register handler in startup:
+  - Create `WorkspaceSymbolProvider` in `LspServerStartupActivity` and inject it into `WorkspaceSymbolHandler`.
+  - Call `WorkspaceSymbolHandler.register()`.
+
+**Implementation Notes**:
+- Prefer IntelliJ platform indexing/search entry points instead of traversing PSI directly.
+- If symbol kind mappings vary considerably between languages, start with conservative mappings (e.g. class/function/variable/module).
+
+**Files to create**:
+- `intellij/WorkspaceSymbolProvider.kt`
+- `handlers/WorkspaceSymbolHandler.kt`
+
+#### 9.2 Go to Implementation（`textDocument/implementation`）
+**Goal**: Implement “Go to Implementation” navigation
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt`:
+  - Add `ServerCapabilities.implementationProvider`
+- [ ] Update `LifecycleHandler.getServerCapabilities()`:
+  - Advertise `implementationProvider = true`
+- [ ] Create `ImplementationHandler`:
+  - Get PSI element at position
+  - For interface/abstract members, use a "find implementations" search (reuse IntelliJ search/inheritance capabilities).
+  - Convert to `Location[]`
+- [ ] Register handler in startup:
+  - Create and `register()` `ImplementationHandler` in `LspServerStartupActivity`.
+
+**Implementation Notes**:
+- Prefer IntelliJ's built-in inheritance/overriding search to ensure Java ↔ Kotlin interoperability.
+
+**Files to create**:
+- `handlers/ImplementationHandler.kt`
+
+#### 9.3 Code Formatting（`textDocument/formatting` / `textDocument/rangeFormatting`）
+**Goal**: Provide formatting edits without directly modifying project files.
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `DocumentFormattingParams` / `DocumentRangeFormattingParams`
+  - Add `FormattingOptions`
+  - Ensure the `TextEdit`/`Range`/`Position` models are complete.
+- [ ] Update `LifecycleHandler.getServerCapabilities()`:
+  - Advertise `documentFormattingProvider = true`
+  - Advertise `documentRangeFormattingProvider = true`
+- [ ] Create `FormattingProvider`:
+  - Get the `VirtualFile`/`Document`/`PsiFile`.
+  - Format a copy or temporary PSI to avoid modifying the project directly.
+  - Compute the text diff before and after formatting and return LSP `TextEdit[]` (the simplest initial implementation can return a single whole-file replacement edit).
+- [ ] Create `DocumentFormattingHandler`:
+  - Handle `textDocument/formatting`
+- [ ] Create `DocumentRangeFormattingHandler` (optional):
+  - Handle `textDocument/rangeFormatting`
+- [ ] Register handlers in startup:
+  - Create the provider and register the handler in `LspServerStartupActivity`.
+
+**Implementation Notes**:
+- Since document synchronization in this project currently flows primarily from client to server, initially implement formatting by returning edits.
+- If server-to-client `workspace/applyEdit` is supported later, formatting/refactoring can become server-driven.
+
+**Files to create**:
+- `intellij/FormattingProvider.kt`
+- `handlers/DocumentFormattingHandler.kt`
+- `handlers/DocumentRangeFormattingHandler.kt` (optional)
+
+#### 9.4 Code Actions（`textDocument/codeAction`）
+**Goal**: Expose IntelliJ quick fixes / intentions as LSP CodeAction
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `CodeActionParams` / `CodeActionContext`
+  - Add `CodeAction` / `Command`
+  - Add `WorkspaceEdit`-related models for code actions that return edits directly.
+- [ ] Update `LifecycleHandler.getServerCapabilities()`:
+  - Advertise `codeActionProvider = true`
+  - (Optional) Advertise `executeCommandProvider` if intentions are executed using commands.
+- [ ] Create `CodeActionProvider`:
+  - Collect candidate actions for the current range from the IntelliJ intention/quick-fix system (best-effort).
+  - Map them to LSP `CodeAction[]`.
+  - Initially, expose only actions that can be safely represented as a `WorkspaceEdit`; omit complex actions.
+- [ ] Create `CodeActionHandler`:
+  - Handle `textDocument/codeAction`
+- [ ] Create `ExecuteCommandHandler` (optional):
+  - Handle `workspace/executeCommand` for executing some server-side commands.
+- [ ] Register handlers in startup:
+  - Create the provider and register the handler in `LspServerStartupActivity`.
+
+**Implementation Notes**:
+- The main challenge in implementing code actions is that many IntelliJ intentions/quick fixes directly modify PSI/Documents as write operations.
+- To ensure LSP consistency, prioritize actions that can be converted to a WorkspaceEdit and applied by the client.
+
+**Files to create**:
+- `intellij/CodeActionProvider.kt`
+- `handlers/CodeActionHandler.kt`
+- `handlers/ExecuteCommandHandler.kt` (optional)
+
+#### 9.5 Signature Help（`textDocument/signatureHelp`）
+**Goal**: Provide parameter info at call site
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `SignatureHelp` / `SignatureInformation` / `ParameterInformation`
+  - Add `SignatureHelpParams`
+  - Add `SignatureHelpOptions` (including triggerCharacters).
+- [ ] Update `LifecycleHandler.getServerCapabilities()`:
+  - Advertise `signatureHelpProvider` (including triggerCharacters).
+- [ ] Create `SignatureHelpProvider`:
+  - Reuse IntelliJ's parameter information capabilities (an `Editor` context may be required).
+  - Map the parameter list/current parameter index to LSP.
+- [ ] Create `SignatureHelpHandler`:
+  - Handle `textDocument/signatureHelp`
+- [ ] Register handler in startup:
+  - Create the provider and register the handler in `LspServerStartupActivity`.
+
+**Implementation Notes**:
+- If an `Editor` is required, create a temporary one and ensure it is disposed to avoid leaks.
+
+**Files to create**:
+- `intellij/SignatureHelpProvider.kt`
+- `handlers/SignatureHelpHandler.kt`
+
+#### 9.6 Inlay Hints（`textDocument/inlayHint`）
+**Goal**: Provide inlay hints (types/parameter names) in editor
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `InlayHint` / `InlayHintLabelPart` / `InlayHintParams`
+  - Add `InlayHintOptions`
+- [ ] Update `LifecycleHandler.getServerCapabilities()`:
+  - Advertise `inlayHintProvider`
+- [ ] Create `InlayHintsProvider`:
+  - Reuse IntelliJ's computed inlay hints on a best-effort basis.
+  - Map them to LSP `InlayHint[]`.
+- [ ] Create `InlayHintsHandler`:
+  - Handle `textDocument/inlayHint`
+- [ ] Register handler in startup:
+  - Create the provider and register the handler in `LspServerStartupActivity`.
+
+**Implementation Notes**:
+- Inlay hint implementations vary across language plugins; start with a subset of common Java/Kotlin hints.
+
+**Files to create**:
+- `intellij/InlayHintsProvider.kt`
+- `handlers/InlayHintsHandler.kt`
 
 ### Phase 10: Advanced Features
-- Bidirectional document sync
-- Workspace folders
-- File watching
-- Rename refactoring
-- Call hierarchy
-- Type hierarchy
+
+#### 10.1 Bidirectional Requests: Server-Initiated Requests (Foundation)
+**Goal**: Support server -> client requests (e.g. `workspace/applyEdit` / dynamic capability registration).
+
+**Tasks**:
+- [ ] Extend protocol layer to support outgoing requests:
+  - Add handling and dispatch for responses (messages without a method) to `JsonRpcHandler`.
+  - Track pending requests (`id -> deferred/future`) and support timeouts/cancellation.
+  - Generate globally unique request IDs.
+- [ ] Extend server transport to send requests per connection:
+  - Provide `sendRequest()` at the TCP/UDS connection layer and await the response.
+- [ ] Add minimal client API surface:
+  - A `workspace/applyEdit` helper for proactively sending edits to the client for refactoring/formatting and similar scenarios.
+
+**Implementation Notes**:
+- The current code ignores responses as soon as they are received, which blocks all future server->client request capabilities.
+
+#### 10.2 Workspace Folders（`workspace/didChangeWorkspaceFolders`）
+**Goal**: Support multi-root workspaces
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `WorkspaceFolder` / `DidChangeWorkspaceFoldersParams`
+- [ ] Update `LifecycleHandler`:
+  - Support `workspaceFolders` in `initialize`.
+  - Adjust root validation to allow multi-root workspaces or an explicit allowlist.
+- [ ] Create `WorkspaceFoldersHandler`:
+  - Handle `workspace/didChangeWorkspaceFolders`
+  - Update the project roots/access paths (affects URI validation and file resolution).
+- [ ] Register handler in startup:
+  - Create and `register()` `WorkspaceFoldersHandler` in `LspServerStartupActivity`.
+
+**Files to create**:
+- `handlers/WorkspaceFoldersHandler.kt`
+
+#### 10.3 File Watching（`workspace/didChangeWatchedFiles`）
+**Goal**: React to external file changes to refresh caches/diagnostics
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `DidChangeWatchedFilesParams` / `FileEvent` / `FileChangeType`
+- [ ] Create `WatchedFilesHandler`:
+  - Handle `workspace/didChangeWatchedFiles`
+  - Refresh the `VirtualFile`; trigger diagnostics again or clear caches as needed.
+- [ ] Register handler in startup:
+  - Create and `register()` `WatchedFilesHandler` in `LspServerStartupActivity`.
+
+**Files to create**:
+- `handlers/WatchedFilesHandler.kt`
+
+#### 10.4 Rename Refactoring（`textDocument/prepareRename` / `textDocument/rename`）
+**Goal**: Provide rename edits across project
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `PrepareRenameParams` / `RenameParams`
+  - Ensure `WorkspaceEdit` / `TextDocumentEdit` / `VersionedTextDocumentIdentifier` and related models are complete.
+- [ ] Update `LifecycleHandler.getServerCapabilities()`:
+  - Advertise `renameProvider` (supporting `prepareProvider = true` is recommended).
+- [ ] Create `RenameProvider`:
+  - Get PSI element at position
+  - Validate whether renaming is allowed and return the range/placeholder for prepareRename.
+  - Find all usages and generate a `WorkspaceEdit`.
+- [ ] Create `PrepareRenameHandler`:
+  - Handle `textDocument/prepareRename`
+- [ ] Create `RenameHandler`:
+  - Handle `textDocument/rename`
+- [ ] Register handlers in startup:
+  - Create the provider and register the handler in `LspServerStartupActivity`.
+
+**Implementation Notes**:
+- Correctness, not text replacement, is central to rename; reuse IntelliJ refactoring/reference resolution capabilities whenever possible.
+
+**Files to create**:
+- `intellij/RenameProvider.kt`
+- `handlers/PrepareRenameHandler.kt`
+- `handlers/RenameHandler.kt`
+
+#### 10.5 Call Hierarchy（`textDocument/prepareCallHierarchy` / `callHierarchy/*`）
+**Goal**: Provide caller/callee navigation
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `CallHierarchyItem` / `CallHierarchyPrepareParams`
+  - Add `CallHierarchyIncomingCallsParams` / `CallHierarchyOutgoingCallsParams`
+- [ ] Update `LifecycleHandler.getServerCapabilities()`:
+  - Advertise `callHierarchyProvider = true`
+- [ ] Create `CallHierarchyProvider`:
+  - Prepare: Construct a `CallHierarchyItem` from the current position.
+  - Incoming/Outgoing: Build call relationships using IntelliJ search/reference capabilities (best-effort).
+- [ ] Create handlers:
+  - Handle `textDocument/prepareCallHierarchy`
+  - Handle `callHierarchy/incomingCalls`
+  - Handle `callHierarchy/outgoingCalls`
+- [ ] Register handlers in startup
+
+**Files to create**:
+- `intellij/CallHierarchyProvider.kt`
+- `handlers/CallHierarchyHandler.kt`
+
+#### 10.6 Type Hierarchy（`textDocument/prepareTypeHierarchy` / `typeHierarchy/*`）
+**Goal**: Provide supertypes/subtypes navigation
+
+**Tasks**:
+- [ ] Update `protocol/models/LspTypes.kt` (complete the protocol models):
+  - Add `TypeHierarchyItem` / `TypeHierarchyPrepareParams`
+  - Add `TypeHierarchySupertypesParams` / `TypeHierarchySubtypesParams`
+- [ ] Update `LifecycleHandler.getServerCapabilities()`:
+  - Advertise `typeHierarchyProvider = true`
+- [ ] Create `TypeHierarchyProvider`:
+  - Prepare: Locate the class/interface and construct a `TypeHierarchyItem`.
+  - Supertypes: Enumerate the inheritance/implementation chain upward.
+  - Subtypes: Find all subclasses/implementations (limit result count and account for performance).
+- [ ] Create handlers:
+  - Handle `textDocument/prepareTypeHierarchy`
+  - Handle `typeHierarchy/supertypes`
+  - Handle `typeHierarchy/subtypes`
+- [ ] Register handlers in startup
+
+**Files to create**:
+- `intellij/TypeHierarchyProvider.kt`
+- `handlers/TypeHierarchyHandler.kt`
 
 ## Success Criteria
 

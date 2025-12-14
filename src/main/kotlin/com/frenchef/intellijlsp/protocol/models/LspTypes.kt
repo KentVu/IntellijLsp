@@ -250,6 +250,7 @@ data class ServerCapabilities(
     val completionProvider: CompletionOptions?,
     val signatureHelpProvider: SignatureHelpOptions?,
     val definitionProvider: Boolean?,
+    val typeDefinitionProvider: Boolean?,  // T031: abcoder compatibility
     val referencesProvider: Boolean?,
     val documentHighlightProvider: Boolean?,
     val documentSymbolProvider: Boolean?,
@@ -262,6 +263,7 @@ data class ServerCapabilities(
     val renameProvider: Boolean?,
     val documentLinkProvider: DocumentLinkOptions?,
     val executeCommandProvider: ExecuteCommandOptions?,
+    val semanticTokensProvider: SemanticTokensOptions?,  // T033: abcoder compatibility
     val experimental: JsonElement?
 )
 
@@ -377,3 +379,173 @@ enum class CompletionTriggerKind(val value: Int) {
     TRIGGER_FOR_INCOMPLETE_COMPLETIONS(3)
 }
 
+// ============================================================================
+// T031: TypeDefinition parameters (abcoder compatibility)
+// ============================================================================
+
+// TypeDefinitionParams is identical to TextDocumentPositionParams and can be reused.
+
+// ============================================================================
+// T032: DocumentSymbol types (abcoder compatibility)
+// ============================================================================
+
+/**
+ * Parameters for a document symbol request.
+ */
+data class DocumentSymbolParams(
+    val textDocument: TextDocumentIdentifier
+)
+
+/**
+ * Hierarchical document symbol (LSP 3.17).
+ */
+data class DocumentSymbol(
+    val name: String,
+    val detail: String?,
+    val kind: SymbolKind,
+    val tags: List<Int>?,
+    val deprecated: Boolean?,
+    val range: Range,
+    val selectionRange: Range,
+    val children: List<DocumentSymbol>?
+)
+
+/**
+ * Flat symbol information (for compatibility with older clients).
+ */
+data class SymbolInformation(
+    val name: String,
+    val kind: SymbolKind,
+    val tags: List<Int>?,
+    val deprecated: Boolean?,
+    val location: Location,
+    val containerName: String?
+)
+
+/**
+ * Symbol kind enumeration (LSP 3.17).
+ */
+enum class SymbolKind(val value: Int) {
+    FILE(1),
+    MODULE(2),
+    NAMESPACE(3),
+    PACKAGE(4),
+    CLASS(5),
+    METHOD(6),
+    PROPERTY(7),
+    FIELD(8),
+    CONSTRUCTOR(9),
+    ENUM(10),
+    INTERFACE(11),
+    FUNCTION(12),
+    VARIABLE(13),
+    CONSTANT(14),
+    STRING(15),
+    NUMBER(16),
+    BOOLEAN(17),
+    ARRAY(18),
+    OBJECT(19),
+    KEY(20),
+    NULL(21),
+    ENUM_MEMBER(22),
+    STRUCT(23),
+    EVENT(24),
+    OPERATOR(25),
+    TYPE_PARAMETER(26)
+}
+
+// ============================================================================
+// T033: SemanticTokens types (abcoder compatibility)
+// ============================================================================
+
+/**
+ * Server capability options for SemanticTokens.
+ */
+data class SemanticTokensOptions(
+    val legend: SemanticTokensLegend,
+    val range: Boolean?,
+    val full: SemanticTokensFullOptions?
+)
+
+/**
+ * Full tokens options (supports delta).
+ */
+data class SemanticTokensFullOptions(
+    val delta: Boolean?
+)
+
+/**
+ * SemanticTokens legend (defines tokenTypes and tokenModifiers).
+ */
+data class SemanticTokensLegend(
+    val tokenTypes: List<String>,
+    val tokenModifiers: List<String>
+)
+
+/**
+ * Parameters for a full SemanticTokens request.
+ */
+data class SemanticTokensParams(
+    val textDocument: TextDocumentIdentifier
+)
+
+/**
+ * Parameters for a range SemanticTokens request.
+ */
+data class SemanticTokensRangeParams(
+    val textDocument: TextDocumentIdentifier,
+    val range: Range
+)
+
+/**
+ * SemanticTokens response.
+ */
+data class SemanticTokens(
+    val resultId: String?,
+    val data: List<Int>
+)
+
+/**
+ * Standard token types (LSP 3.17).
+ */
+object SemanticTokenTypes {
+    const val NAMESPACE = "namespace"
+    const val TYPE = "type"
+    const val CLASS = "class"
+    const val ENUM = "enum"
+    const val INTERFACE = "interface"
+    const val STRUCT = "struct"
+    const val TYPE_PARAMETER = "typeParameter"
+    const val PARAMETER = "parameter"
+    const val VARIABLE = "variable"
+    const val PROPERTY = "property"
+    const val ENUM_MEMBER = "enumMember"
+    const val EVENT = "event"
+    const val FUNCTION = "function"
+    const val METHOD = "method"
+    const val MACRO = "macro"
+    const val KEYWORD = "keyword"
+    const val MODIFIER = "modifier"
+    const val COMMENT = "comment"
+    const val STRING = "string"
+    const val NUMBER = "number"
+    const val REGEXP = "regexp"
+    const val OPERATOR = "operator"
+    const val DECORATOR = "decorator"
+}
+
+/**
+ * Standard token modifiers (LSP 3.17).
+ */
+object SemanticTokenModifiers {
+    const val DECLARATION = "declaration"
+    const val DEFINITION = "definition"
+    const val READONLY = "readonly"
+    const val STATIC = "static"
+    const val DEPRECATED = "deprecated"
+    const val ABSTRACT = "abstract"
+    const val ASYNC = "async"
+    const val MODIFICATION = "modification"
+    const val DOCUMENTATION = "documentation"
+    const val DEFAULT_LIBRARY = "defaultLibrary"
+}
