@@ -72,7 +72,15 @@ object PsiMapper {
      * Convert VirtualFile to URI string.
      */
     fun virtualFileToUri(virtualFile: VirtualFile): String {
-        return "file://${virtualFile.path}"
+        val url = virtualFile.url
+        // Windows paths require the file:/// format.
+        val uri = if (url.startsWith("file://")) {
+            url.replace("file://", "file:///")
+        } else {
+            url
+        }
+        log.info("VirtualFile URI conversion: $url -> $uri")
+        return uri
     }
 
     /**
