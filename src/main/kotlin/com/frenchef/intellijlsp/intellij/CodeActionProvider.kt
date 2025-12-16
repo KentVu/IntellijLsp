@@ -5,6 +5,8 @@ import com.intellij.codeInsight.daemon.impl.DaemonCodeAnalyzerEx
 import com.intellij.codeInsight.daemon.impl.HighlightInfo
 import com.intellij.codeInsight.intention.IntentionAction
 import com.intellij.codeInsight.intention.IntentionManager
+import com.intellij.codeInspection.LocalQuickFix
+import com.intellij.codeInspection.ProblemHighlightType
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.logger
@@ -18,14 +20,16 @@ import com.intellij.psi.PsiFile
 /**
  * CodeAction provider compliant with the LSP 3.17 specification.
  *
- * Collects CodeActions in two ways:
- * 1. QuickFixes from DaemonCodeAnalyzer HighlightInfo (for diagnostic-related fixes).
- * 2. Intentions from IntentionManager (checks availability with isAvailable).
+ * Collects CodeActions from three sources:
+ * 1. QuickFixes from DaemonCodeAnalyzer HighlightInfo (diagnostic-related; requires an open file).
+ * 2. ProblemDescriptors from InspectionDiagnosticsProvider (does not require an open file).
+ * 3. Intentions from IntentionManager (checks availability with isAvailable).
  *
  * Returned CodeActions include a data field used to restore context during codeAction/resolve.
  */
 class CodeActionProvider(private val project: Project) {
     private val log = logger<CodeActionProvider>()
+    private val inspectionProvider = InspectionDiagnosticsProvider(project)
 
     private companion object {
         const val MAX_ACTIONS = 50
@@ -54,7 +58,7 @@ class CodeActionProvider(private val project: Project) {
             val actions = mutableListOf<CodeAction>()
             val seenTitles = mutableSetOf<String>()
 
-            // 2. Collect QuickFixes from HighlightInfo (ReadAction).
+            // 2. Collect QuickFixes from HighlightInfo (ReadAction; requires an open file).
             ReadAction.run<RuntimeException> {
                 collectQuickFixesFromHighlights(
                     psiFile,
@@ -67,7 +71,22 @@ class CodeActionProvider(private val project: Project) {
                 )
             }
 
-            // 3. Collect intentions from IntentionManager (EDT handled internally).
+            // 3. If HighlightInfo does not provide enough QuickFixes, try the Inspection API.
+            if (actions.size < 5) {
+                ReadAction.run<RuntimeException> {
+                    collectQuickFixesFromInspections(
+                        psiFile,
+                        document,
+                        startOffset,
+                        endOffset,
+                        uri,
+                        actions,
+                        seenTitles
+                    )
+                }
+            }
+
+            // 4. Collect intentions from IntentionManager (EDT handled internally).
             // Creating an Editor and checking intention availability require the EDT.
             collectAvailableIntentions(psiFile, document, startOffset, uri, actions, seenTitles)
 
@@ -154,6 +173,67 @@ class CodeActionProvider(private val project: Project) {
             }
         } catch (e: Exception) {
             log.trace("Error extracting quick fix: ${e.message}")
+        }
+    }
+
+    /** Collects QuickFixes from InspectionDiagnosticsProvider (does not require an open file). */
+    private fun collectQuickFixesFromInspections(
+        psiFile: PsiFile,
+        document: Document,
+        startOffset: Int,
+        endOffset: Int,
+        uri: String,
+        actions: MutableList<CodeAction>,
+        seenTitles: MutableSet<String>
+    ) {
+        try {
+            val diagnosticsWithDescriptors = inspectionProvider.getDiagnosticsWithDescriptors(psiFile, document)
+
+            for (item in diagnosticsWithDescriptors) {
+                if (actions.size >= MAX_ACTIONS) break
+
+                val diagStartOffset = PsiMapper.positionToOffset(document, item.diagnostic.range.start)
+                val diagEndOffset = PsiMapper.positionToOffset(document, item.diagnostic.range.end)
+
+                // Check whether the diagnostic is within the requested range.
+                if (diagEndOffset < startOffset || diagStartOffset > endOffset) continue
+
+                val fixes = item.descriptor.fixes?.filterIsInstance<LocalQuickFix>() ?: continue
+
+                for (fix in fixes) {
+                    if (actions.size >= MAX_ACTIONS) break
+
+                    val title = fix.name
+                    if (title.isNotBlank() && title !in seenTitles) {
+                        seenTitles.add(title)
+
+                        val isError = item.descriptor.highlightType == ProblemHighlightType.ERROR ||
+                                item.descriptor.highlightType == ProblemHighlightType.GENERIC_ERROR
+
+                        actions.add(
+                            CodeAction(
+                                title = title,
+                                kind = CodeActionKinds.QUICK_FIX,
+                                diagnostics = null,
+                                isPreferred = isError,
+                                edit = null,
+                                command = null,
+                                data = CodeActionData(
+                                    uri = uri,
+                                    offset = diagStartOffset,
+                                    actionTitle = title,
+                                    actionType = "inspection_quickfix"
+                                )
+                            )
+                        )
+                        log.debug("Collected inspection QuickFix: $title")
+                    }
+                }
+            }
+
+            log.debug("Collected ${actions.size} quick fixes from inspections")
+        } catch (e: Exception) {
+            log.debug("Error collecting quick fixes from inspections: ${e.message}")
         }
     }
 

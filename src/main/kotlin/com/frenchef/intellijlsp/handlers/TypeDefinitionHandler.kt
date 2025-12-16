@@ -68,7 +68,7 @@ class TypeDefinitionHandler(
                 // Try to find the element's type definition.
                 val typeElement = resolveTypeDefinition(element)
                 if (typeElement != null) {
-                    val location = PsiMapper.elementToLocation(typeElement)
+                    val location = PsiMapper.elementToLocation(typeElement, project)
                     if (location != null) {
                         return@compute gson.toJsonTree(location)
                     }

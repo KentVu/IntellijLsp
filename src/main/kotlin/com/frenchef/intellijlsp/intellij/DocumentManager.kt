@@ -1,12 +1,12 @@
 package com.frenchef.intellijlsp.intellij
 
 import com.frenchef.intellijlsp.protocol.models.TextDocumentContentChangeEvent
-import com.frenchef.intellijlsp.protocol.models.Position
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VirtualFileManager
 import java.net.URI
@@ -18,7 +18,7 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class DocumentManager(private val project: Project) {
     private val log = logger<DocumentManager>()
-    
+
     // Map of URI to document info
     private val documents = ConcurrentHashMap<String, DocumentInfo>()
 
@@ -27,14 +27,14 @@ class DocumentManager(private val project: Project) {
      */
     fun openDocument(uri: String, languageId: String, version: Int, text: String) {
         log.info("Opening document: $uri (version $version)")
-        
+
         val docInfo = DocumentInfo(
             uri = uri,
             languageId = languageId,
             version = version,
             content = text
         )
-        
+
         documents[uri] = docInfo
     }
 
@@ -51,16 +51,16 @@ class DocumentManager(private val project: Project) {
      */
     fun changeDocument(uri: String, version: Int, changes: List<TextDocumentContentChangeEvent>) {
         val docInfo = documents[uri]
-        
+
         if (docInfo == null) {
             log.warn("Attempted to change unopened document: $uri")
             return
         }
 
         log.debug("Changing document: $uri (version $version, ${changes.size} changes)")
-        
+
         var content = docInfo.content
-        
+
         for (change in changes) {
             content = if (change.range == null) {
                 // Full document update
@@ -70,7 +70,7 @@ class DocumentManager(private val project: Project) {
                 applyIncrementalChange(content, change)
             }
         }
-        
+
         documents[uri] = docInfo.copy(version = version, content = content)
     }
 
@@ -79,11 +79,10 @@ class DocumentManager(private val project: Project) {
      */
     fun saveDocument(uri: String) {
         log.info("Saving document: $uri")
-        
-        val virtualFile = getVirtualFile(uri)
-        if (virtualFile != null) {
-            // Trigger VFS refresh so IntelliJ picks up changes from disk
-            virtualFile.refresh(false, false)
+
+        val physicalFile = getPhysicalVirtualFile(uri)
+        if (physicalFile != null) {
+            physicalFile.refresh(false, false)
         }
     }
 
@@ -110,9 +109,20 @@ class DocumentManager(private val project: Project) {
 
     /**
      * Get the VirtualFile for a URI.
+     *
+     * Supports reverse lookup for decompilation cache URIs:
+     * if the URI refers to a cached file, returns the VirtualFile from the original JAR.
      */
     fun getVirtualFile(uri: String): VirtualFile? {
         return try {
+            // Check first whether this is a decompilation cache URI and return the original JAR VirtualFile.
+            val originalVf = DecompileCache.getOriginalVirtualFile(uri)
+            if (originalVf != null) {
+                log.debug("Reverse lookup for cache URI: $uri -> ${originalVf.url}")
+                return originalVf
+            }
+
+            // Regular file.
             val path = URI(uri).path
             VirtualFileManager.getInstance().findFileByUrl("file://$path")
         } catch (e: Exception) {
@@ -123,12 +133,39 @@ class DocumentManager(private val project: Project) {
 
     /**
      * Get the IntelliJ Document for a URI.
+     *
+     * Note: For decompiled cache files, this must return the Document for the cached file on disk,
+     * not the JAR VirtualFile resolved by cache->JAR lookup (JAR files often have no Document).
      */
     fun getIntellijDocument(uri: String): Document? {
-        val virtualFile = getVirtualFile(uri) ?: return null
-        
+        val physicalFile = getPhysicalVirtualFile(uri) ?: return null
+
         return ReadAction.compute<Document?, RuntimeException> {
-            FileDocumentManager.getInstance().getDocument(virtualFile)
+            FileDocumentManager.getInstance().getDocument(physicalFile)
+        }
+    }
+
+    /**
+     * Gets the physical file on disk without performing cache->JAR lookup.
+     */
+    private fun getPhysicalVirtualFile(uri: String): VirtualFile? {
+        return try {
+            val rawPath = URI(uri).path ?: return null
+            val localPath =
+                if (rawPath.length >= 3 && rawPath[0] == '/' && rawPath[2] == ':') rawPath.substring(1) else rawPath
+
+            // First try to find in VFS (fast)
+            var file = LocalFileSystem.getInstance().findFileByPath(localPath)
+
+            // If not found, try to refresh and find (slower but handles new files)
+            if (file == null) {
+                file = LocalFileSystem.getInstance().refreshAndFindFileByPath(localPath)
+            }
+
+            file
+        } catch (e: Exception) {
+            log.warn("Failed to get physical VirtualFile for URI: $uri", e)
+            null
         }
     }
 
@@ -137,32 +174,32 @@ class DocumentManager(private val project: Project) {
      */
     private fun applyIncrementalChange(content: String, change: TextDocumentContentChangeEvent): String {
         val range = change.range ?: return change.text
-        
+
         val lines = content.split("\n")
         val startLine = range.start.line
         val startChar = range.start.character
         val endLine = range.end.line
         val endChar = range.end.character
-        
+
         if (startLine < 0 || startLine >= lines.size) {
             log.warn("Invalid start line: $startLine (document has ${lines.size} lines)")
             return content
         }
-        
+
         if (endLine < 0 || endLine >= lines.size) {
             log.warn("Invalid end line: $endLine (document has ${lines.size} lines)")
             return content
         }
-        
+
         // Build the new content
         val result = StringBuilder()
-        
+
         // Add lines before the change
         for (i in 0 until startLine) {
             result.append(lines[i])
             if (i < lines.size - 1) result.append("\n")
         }
-        
+
         // Add the part of the start line before the change
         if (startLine < lines.size) {
             val startLineContent = lines[startLine]
@@ -170,10 +207,10 @@ class DocumentManager(private val project: Project) {
                 result.append(startLineContent.substring(0, startChar))
             }
         }
-        
+
         // Add the new text
         result.append(change.text)
-        
+
         // Add the part of the end line after the change
         if (endLine < lines.size) {
             val endLineContent = lines[endLine]
@@ -181,13 +218,13 @@ class DocumentManager(private val project: Project) {
                 result.append(endLineContent.substring(endChar))
             }
         }
-        
+
         // Add lines after the change
         for (i in endLine + 1 until lines.size) {
             result.append("\n")
             result.append(lines[i])
         }
-        
+
         return result.toString()
     }
 
@@ -201,4 +238,3 @@ class DocumentManager(private val project: Project) {
         val content: String
     )
 }
-

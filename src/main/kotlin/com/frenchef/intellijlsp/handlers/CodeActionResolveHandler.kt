@@ -1,6 +1,8 @@
 package com.frenchef.intellijlsp.handlers
 
 import com.frenchef.intellijlsp.intellij.DocumentManager
+import com.frenchef.intellijlsp.intellij.InspectionDiagnosticsProvider
+import com.frenchef.intellijlsp.intellij.PsiMapper
 import com.frenchef.intellijlsp.protocol.JsonRpcHandler
 import com.frenchef.intellijlsp.protocol.LspGson
 import com.frenchef.intellijlsp.protocol.models.*
@@ -9,6 +11,8 @@ import com.intellij.codeInsight.daemon.impl.DaemonCodeAnalyzerEx
 import com.intellij.codeInsight.daemon.impl.HighlightInfo
 import com.intellij.codeInsight.intention.IntentionAction
 import com.intellij.codeInsight.intention.IntentionManager
+import com.intellij.codeInspection.LocalQuickFix
+import com.intellij.codeInspection.ProblemDescriptor
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.diagnostic.logger
@@ -25,7 +29,7 @@ import com.intellij.psi.PsiManager
  *
  * Lazily resolves the edit property of a CodeAction:
  * 1. Restores context (uri, offset, actionTitle) from the data field.
- * 2. Finds the corresponding IntentionAction/QuickFix.
+ * 2. Finds the corresponding IntentionAction/QuickFix/LocalQuickFix.
  * 3. Applies it to a PSI file copy.
  * 4. Calculates the diff to generate a WorkspaceEdit.
  */
@@ -36,6 +40,7 @@ class CodeActionResolveHandler(
 ) {
     private val log = logger<CodeActionResolveHandler>()
     private val gson = LspGson.instance
+    private val inspectionProvider = InspectionDiagnosticsProvider(project)
 
     /** Registers the codeAction/resolve handler. */
     fun register() {
@@ -102,6 +107,7 @@ class CodeActionResolveHandler(
             when (data.actionType) {
                 "quickfix" -> resolveQuickFix(psiFile, document, data)
                 "intention" -> resolveIntention(psiFile, document, data)
+                "inspection_quickfix" -> resolveInspectionQuickFix(psiFile, document, data)
                 else -> {
                     log.warn("Unknown action type: ${data.actionType}")
                     null
@@ -225,6 +231,108 @@ class CodeActionResolveHandler(
         }
     }
 
+    /** Resolves an InspectionQuickFix CodeAction. */
+    private fun resolveInspectionQuickFix(
+        psiFile: PsiFile,
+        document: Document,
+        data: CodeActionData
+    ): WorkspaceEdit? {
+        try {
+            var result: WorkspaceEdit? = null
+
+            com.intellij.openapi.application.ApplicationManager.getApplication().invokeAndWait {
+                // Get diagnostic information.
+                val diagnosticsWithDescriptors = inspectionProvider.getDiagnosticsWithDescriptors(psiFile, document)
+
+                // Find the matching QuickFix.
+                var foundDescriptor: ProblemDescriptor? = null
+                var foundFix: LocalQuickFix? = null
+
+                for (item in diagnosticsWithDescriptors) {
+                    val diagStartOffset = PsiMapper.positionToOffset(document, item.diagnostic.range.start)
+                    val diagEndOffset = PsiMapper.positionToOffset(document, item.diagnostic.range.end)
+
+                    // Check whether the offset matches.
+                    if (data.offset !in diagStartOffset..diagEndOffset) continue
+
+                    val fixes = item.descriptor.fixes?.filterIsInstance<LocalQuickFix>() ?: continue
+
+                    for (fix in fixes) {
+                        if (fix.name == data.actionTitle) {
+                            foundDescriptor = item.descriptor
+                            foundFix = fix
+                            break
+                        }
+                    }
+
+                    if (foundFix != null) break
+                }
+
+                if (foundDescriptor != null && foundFix != null) {
+                    result = applyLocalQuickFixAndGetEdit(psiFile, document, foundFix, foundDescriptor, data)
+                } else {
+                    log.warn("InspectionQuickFix not found: ${data.actionTitle}")
+                }
+            }
+
+            return result
+        } catch (e: com.intellij.openapi.progress.ProcessCanceledException) {
+            throw e
+        } catch (e: Exception) {
+            log.error("Error resolving inspection quickfix", e)
+            return null
+        }
+    }
+
+    /**
+     * Applies a LocalQuickFix and retrieves the edit.
+     */
+    private fun applyLocalQuickFixAndGetEdit(
+        psiFile: PsiFile,
+        document: Document,
+        fix: LocalQuickFix,
+        descriptor: ProblemDescriptor,
+        data: CodeActionData
+    ): WorkspaceEdit? {
+        val originalText = document.text
+
+        try {
+            var modifiedText: String? = null
+
+            WriteCommandAction.runWriteCommandAction(project) {
+                try {
+                    PsiDocumentManager.getInstance(project).commitDocument(document)
+
+                    fix.applyFix(project, descriptor)
+                    PsiDocumentManager.getInstance(project).commitDocument(document)
+
+                    modifiedText = document.text
+                } catch (e: Exception) {
+                    log.warn("Failed to apply LocalQuickFix: ${e.message}", e)
+                } finally {
+                    try {
+                        PsiDocumentManager.getInstance(project).doPostponedOperationsAndUnblockDocument(document)
+                        document.setText(originalText)
+                        PsiDocumentManager.getInstance(project).commitDocument(document)
+                    } catch (e: Exception) {
+                        log.warn("Failed to rollback document text: ${e.message}", e)
+                    }
+                }
+            }
+
+            val after = modifiedText ?: return null
+            if (after == originalText) return null
+
+            val textEdits = computeFullDocumentReplaceEdit(originalText, after)
+            if (textEdits.isEmpty()) return null
+
+            return WorkspaceEdit(changes = mapOf(data.uri to textEdits))
+        } catch (e: Exception) {
+            log.error("Error applying LocalQuickFix and getting edit", e)
+            return null
+        }
+    }
+
     /**
      * Temporarily applies the action to the original file, calculates the edit, and immediately rolls back the text.
      *
@@ -261,6 +369,9 @@ class CodeActionResolveHandler(
                     log.warn("Failed to invoke action: ${e.message}", e)
                 } finally {
                     try {
+                        // Unblock the document to process pending PSI operations.
+                        PsiDocumentManager.getInstance(project)
+                            .doPostponedOperationsAndUnblockDocument(originalDocument)
                         // Roll back so the actual file is not changed (LSP resolve only needs the edit).
                         originalDocument.setText(originalText)
                         PsiDocumentManager.getInstance(project).commitDocument(originalDocument)

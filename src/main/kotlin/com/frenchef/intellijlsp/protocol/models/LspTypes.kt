@@ -219,6 +219,7 @@ data class ServerCapabilities(
     val inlayHintProvider: InlayHintOptions?, // Phase 9: Inlay Hints
     val callHierarchyProvider: Boolean?, // Phase 10: Call Hierarchy (T006)
     val typeHierarchyProvider: Boolean?, // Phase 10: Type Hierarchy (T006)
+    val diagnosticProvider: DiagnosticOptions?, // LSP 3.17: pull diagnostics.
     val workspace: WorkspaceCapabilities?, // Phase 10: Workspace Folders (T006)
     val experimental: JsonElement?
 )
@@ -854,4 +855,88 @@ data class WorkspaceCapabilities(val workspaceFolders: WorkspaceFoldersServerCap
 data class WorkspaceFoldersServerCapabilities(
     val supported: Boolean? = null,
     val changeNotifications: Boolean? = null
+)
+
+// ============================================================================
+// LSP 3.17: Pull diagnostics (textDocument/diagnostic).
+// ============================================================================
+
+/** textDocument/diagnostic request parameters. */
+data class DocumentDiagnosticParams(
+    /** Document for which diagnostics are requested. */
+    val textDocument: TextDocumentIdentifier,
+    /** Optional request identifier for incremental updates. */
+    val identifier: String? = null,
+    /** resultId from the previous request, used for incremental updates. */
+    val previousResultId: String? = null
+)
+
+/** textDocument/diagnostic response - full report. */
+data class FullDocumentDiagnosticReport(
+    /** Report kind, fixed to "full". */
+    val kind: String = DocumentDiagnosticReportKind.FULL,
+    /** Optional result identifier for subsequent incremental requests. */
+    val resultId: String? = null,
+    /** List of diagnostics. */
+    val items: List<Diagnostic>
+)
+
+/** textDocument/diagnostic response - unchanged report. */
+data class UnchangedDocumentDiagnosticReport(
+    /** Report kind, fixed to "unchanged". */
+    val kind: String = DocumentDiagnosticReportKind.UNCHANGED,
+    /** Result identifier. */
+    val resultId: String
+)
+
+/** Diagnostic report kind. */
+object DocumentDiagnosticReportKind {
+    const val FULL = "full"
+    const val UNCHANGED = "unchanged"
+}
+
+/** workspace/diagnostic request parameters. */
+data class WorkspaceDiagnosticParams(
+    /** Optional request identifier. */
+    val identifier: String? = null,
+    /** Partial result tokens returned previously. */
+    val previousResultIds: List<PreviousResultId>? = null
+)
+
+/** Associates a document URI with a resultId. */
+data class PreviousResultId(
+    /** Document URI. */
+    val uri: String,
+    /** Previous resultId. */
+    val value: String
+)
+
+/** workspace/diagnostic response. */
+data class WorkspaceDiagnosticReport(
+    /** List of diagnostic reports grouped by document. */
+    val items: List<WorkspaceDocumentDiagnosticReport>
+)
+
+/** Document-level report for workspace diagnostics. */
+data class WorkspaceDocumentDiagnosticReport(
+    /** Report kind. */
+    val kind: String,
+    /** Document URI. */
+    val uri: String,
+    /** Document version. */
+    val version: Int? = null,
+    /** Result identifier. */
+    val resultId: String? = null,
+    /** List of diagnostics (only when kind == "full"). */
+    val items: List<Diagnostic>? = null
+)
+
+/** Diagnostic server capability options. */
+data class DiagnosticOptions(
+    /** Optional server identifier. */
+    val identifier: String? = null,
+    /** Whether related diagnostics across documents are supported. */
+    val interFileDependencies: Boolean = false,
+    /** Whether workspace diagnostics are supported. */
+    val workspaceDiagnostics: Boolean = false
 )

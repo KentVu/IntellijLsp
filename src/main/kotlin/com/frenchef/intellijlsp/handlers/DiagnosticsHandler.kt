@@ -1,22 +1,32 @@
 package com.frenchef.intellijlsp.handlers
 
+import com.frenchef.intellijlsp.intellij.BackgroundAnalyzer
 import com.frenchef.intellijlsp.intellij.DiagnosticsProvider
 import com.frenchef.intellijlsp.intellij.DocumentManager
+import com.frenchef.intellijlsp.intellij.InspectionDiagnosticsProvider
+import com.frenchef.intellijlsp.protocol.models.Diagnostic
 import com.frenchef.intellijlsp.protocol.models.PublishDiagnosticsParams
 import com.frenchef.intellijlsp.server.LspServer
 import com.frenchef.intellijlsp.server.TcpLspServer
 import com.frenchef.intellijlsp.server.UdsLspServer
+import com.frenchef.intellijlsp.util.LspLogger
 import com.intellij.codeInsight.daemon.DaemonCodeAnalyzer
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
+import com.intellij.psi.PsiManager
 import kotlinx.coroutines.*
 import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Handles publishing diagnostics to LSP clients.
- * Monitors IntelliJ's code analysis and pushes updates to clients.
+ * 
+ * Retrieves diagnostics using three strategies:
+ * 1. BackgroundAnalyzer - Opens the file in an editor to trigger DaemonCodeAnalyzer.
+ * 2. MarkupModel (DiagnosticsProvider) - Fast, but requires the file to be open in an editor.
+ * 3. Inspection API (InspectionDiagnosticsProvider) - Slower, but does not require the file to be open.
  */
 class DiagnosticsHandler(
     private val project: Project,
@@ -26,6 +36,12 @@ class DiagnosticsHandler(
 ) {
     private val log = logger<DiagnosticsHandler>()
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    // Background analyzer for triggering code analysis
+    private val backgroundAnalyzer = BackgroundAnalyzer(project)
+
+    // Inspection-based provider for files not open in editor
+    private val inspectionProvider = InspectionDiagnosticsProvider(project)
     
     // Track pending diagnostic updates per file to debounce
     private val pendingUpdates = ConcurrentHashMap<String, Job>()
@@ -55,6 +71,7 @@ class DiagnosticsHandler(
 
     /**
      * Publish diagnostics for a specific file.
+     * Uses BackgroundAnalyzer + MarkupModel + Inspection API approaches.
      */
     fun publishDiagnosticsForFile(uri: String) {
         // Cancel any pending update for this file
@@ -72,8 +89,79 @@ class DiagnosticsHandler(
                     log.debug("Cannot publish diagnostics for $uri: file or document not found")
                     return@launch
                 }
+
+                // Step 1: Ensure the file is open in an editor to trigger DaemonCodeAnalyzer.
+                if (!virtualFile.isValid) return@launch
+                backgroundAnalyzer.ensureFileOpenForAnalysis(virtualFile, uri)
+
+                // Step 2 & 3: Poll MarkupModel, waiting for at most 1 second.
+                var diagnostics = emptyList<Diagnostic>()
+                var source = "MarkupModel"
+                var attempts = 0
+                val maxAttempts = 10 // 10 * 100ms = 1s max
+
+                while (attempts < maxAttempts) {
+                    attempts++
+                    delay(100) // Use delay rather than Thread.sleep because this runs in a coroutine.
+
+                    if (!virtualFile.isValid) {
+                        LspLogger.debug("Diagnostics", "File became invalid; stopping polling: $uri")
+                        return@launch
+                    }
+
+                    val currentDiagnostics = diagnosticsProvider.getDiagnosticsByUri(uri, virtualFile, document)
+                    if (currentDiagnostics.isNotEmpty()) {
+                        // Diagnostics found; use them immediately.
+                        LspLogger.debug(
+                            "Diagnostics",
+                            "MarkupModel returned ${currentDiagnostics.size} diagnostics quickly (attempt $attempts): $uri"
+                        )
+                        diagnostics = currentDiagnostics
+                        break
+                    }
+                }
+
+                if (!virtualFile.isValid) return@launch
+
+                // Retry in case the polling period ended without results.
+                if (diagnostics.isEmpty()) {
+                    diagnostics = diagnosticsProvider.getDiagnosticsByUri(uri, virtualFile, document)
+                    if (diagnostics.isNotEmpty()) {
+                        LspLogger.info("Diagnostics", "MarkupModel finally returned ${diagnostics.size} diagnostics: $uri")
+                    }
+                } else {
+                    LspLogger.info("Diagnostics", "MarkupModel returned ${diagnostics.size} diagnostics: $uri")
+                }
+
+                // Step 4: If still no diagnostics from MarkupModel, try Inspection API
+                if (diagnostics.isEmpty()) {
+                    if (!virtualFile.isValid) return@launch
+
+                    LspLogger.info("Diagnostics", "Trying Inspection API for $uri")
+                    try {
+                        diagnostics = ReadAction.compute<List<Diagnostic>, RuntimeException> {
+                            if (!virtualFile.isValid) return@compute emptyList()
+                            val psiFile = PsiManager.getInstance(project).findFile(virtualFile)
+                            if (psiFile != null) {
+                                inspectionProvider.getDiagnostics(psiFile, document)
+                            } else {
+                                emptyList()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // Ignore file access errors.
+                        LspLogger.warn("Diagnostics", "Inspection API error (the file may have been deleted): ${e.message}")
+                    }
+
+                    source = "InspectionAPI"
+                    if (diagnostics.isNotEmpty()) {
+                        LspLogger.info(
+                            "Diagnostics",
+                            "Inspection API returned ${diagnostics.size} diagnostics for $uri"
+                        )
+                    }
+                }
                 
-                val diagnostics = diagnosticsProvider.getDiagnosticsByUri(uri, virtualFile, document)
                 val version = documentManager.getDocumentVersion(uri)
                 
                 val params = PublishDiagnosticsParams(
@@ -84,8 +172,8 @@ class DiagnosticsHandler(
                 
                 // Send notification to client
                 broadcastDiagnostics(params)
-                
-                log.debug("Published ${diagnostics.size} diagnostics for $uri")
+
+                LspLogger.info("Diagnostics", "Published ${diagnostics.size} diagnostics ($source) for $uri")
                 
             } catch (e: Exception) {
                 if (e !is CancellationException) {
@@ -109,8 +197,10 @@ class DiagnosticsHandler(
                 val openFiles = fileEditorManager.openFiles
                 
                 for (file in openFiles) {
-                    val uri = com.frenchef.intellijlsp.intellij.PsiMapper.virtualFileToUri(file)
-                    publishDiagnosticsForFile(uri)
+                    val uri = com.frenchef.intellijlsp.intellij.PsiMapper.virtualFileToUri(file, project)
+                    if (uri != null) {
+                        publishDiagnosticsForFile(uri)
+                    }
                 }
             } catch (e: Exception) {
                 log.warn("Error publishing diagnostics for open files", e)
@@ -169,6 +259,7 @@ class DiagnosticsHandler(
         log.info("Stopping diagnostics handler")
         scope.cancel()
         pendingUpdates.clear()
+        backgroundAnalyzer.dispose()
     }
 }
 
