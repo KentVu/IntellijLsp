@@ -37,6 +37,8 @@ class DiagnosticsProvider(private val project: Project) {
                 if (markupModel != null) {
                     // Get all range highlighters (these contain error/warning information)
                     val allHighlighters = markupModel.allHighlighters
+
+                    log.debug("MarkupModel returned ${allHighlighters.size} highlighters")
                     
                     for (highlighter in allHighlighters) {
                         // Get the HighlightInfo from the error stripe tooltip
@@ -51,6 +53,8 @@ class DiagnosticsProvider(private val project: Project) {
                                         "${diagnostic.message}:${diagnostic.severity?.value}"
                                 if (seen.add(key)) {
                                     diagnostics.add(diagnostic)
+                                } else {
+                                    log.debug("Filtered duplicate diagnostic: L${diagnostic.range.start.line + 1} - ${diagnostic.message}")
                                 }
                             }
                         }

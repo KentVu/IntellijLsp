@@ -1,9 +1,11 @@
 package com.frenchef.intellijlsp.handlers
 
+import com.frenchef.intellijlsp.intellij.DecompileCache
 import com.frenchef.intellijlsp.protocol.JsonRpcHandler
 import com.frenchef.intellijlsp.protocol.LspException
 import com.frenchef.intellijlsp.protocol.LspGson
 import com.frenchef.intellijlsp.protocol.models.*
+import com.frenchef.intellijlsp.services.LspProjectService
 import com.google.gson.JsonElement
 import com.google.gson.JsonNull
 import com.intellij.openapi.diagnostic.logger
@@ -24,6 +26,13 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
     private var shutdownRequested = false
 
     private var clientCapabilities: ClientCapabilities? = null
+
+    /**
+     * Some client capabilities (e.g. textDocument.diagnostic) are not modeled in our ClientCapabilities yet.
+     * We detect them from the raw initialize params JSON.
+     */
+    @Volatile
+    private var clientSupportsPullDiagnostics: Boolean = false
 
     fun register() {
         jsonRpcHandler.registerRequestHandler("initialize", this::handleInitialize)
@@ -48,6 +57,19 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
 
         val initParams = gson.fromJson(params, InitializeParams::class.java)
         clientCapabilities = initParams.capabilities
+
+        // Detect LSP 3.17 Pull diagnostics support: capabilities.textDocument.diagnostic
+        clientSupportsPullDiagnostics =
+            try {
+                val capsObj = params.asJsonObject.getAsJsonObject("capabilities")
+                val textDocumentObj = capsObj?.getAsJsonObject("textDocument")
+                textDocumentObj?.has("diagnostic") == true
+            } catch (_: Exception) {
+                false
+            }
+
+        // Store the choice in project-level service so DiagnosticsHandler can suppress Push diagnostics.
+        project.getService(LspProjectService::class.java).setUsePullDiagnostics(clientSupportsPullDiagnostics)
 
         log.info("Client root URI: ${initParams.rootUri}")
         log.info("Client capabilities received")
@@ -84,6 +106,10 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
         // Reset initialization state to allow the client to reconnect.
         initialized = false
         clientCapabilities = null
+        clientSupportsPullDiagnostics = false
+        project.getService(LspProjectService::class.java).setUsePullDiagnostics(false)
+        // Clear the decompilation cache directory.
+        DecompileCache.clearCache(project)
         return JsonNull.INSTANCE
     }
 
@@ -96,11 +122,16 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
         initialized = false
         shutdownRequested = false
         clientCapabilities = null
+        clientSupportsPullDiagnostics = false
+        project.getService(LspProjectService::class.java).setUsePullDiagnostics(false)
     }
 
     /** Handle the 'exit' notification. Exits the server. */
     private fun handleExit(params: JsonElement?) {
         log.info("Handling exit notification for project: ${project.name}")
+
+        // Clear the decompilation cache as a safeguard in case shutdown was not called.
+        DecompileCache.clearCache(project)
 
         // The exit notification is sent to request the server to exit.
         // We don't actually exit the process since we're running inside IntelliJ,
@@ -171,10 +202,10 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
                 ),
             signatureHelpProvider = SignatureHelpOptions(triggerCharacters = listOf("(", ",")),
             definitionProvider = true,
-            typeDefinitionProvider = true,  // T039: abcoder compatibility
+            typeDefinitionProvider = true, // T039: abcoder compatibility.
             referencesProvider = true,
             documentHighlightProvider = true,
-            documentSymbolProvider = true,  // T040: abcoder compatibility
+            documentSymbolProvider = true, // T040: abcoder compatibility.
             workspaceSymbolProvider = true, // Phase 9: Workspace Symbol
             codeActionProvider =
                 CodeActionOptions(
@@ -197,7 +228,7 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
             documentLinkProvider = null,
             executeCommandProvider = null,
             implementationProvider = true, // Phase 9: Go to Implementation
-            // T041: SemanticTokens - abcoder compatibility
+            // T041: SemanticTokens - abcoder compatibility.
             semanticTokensProvider =
                 SemanticTokensOptions(
                     legend =
@@ -245,7 +276,7 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
                 identifier = "intellij-lsp",
                 interFileDependencies = true,
                 workspaceDiagnostics = false
-            ), // LSP 3.17: pull diagnostics.
+            ).takeIf { clientSupportsPullDiagnostics }, // LSP 3.17: Declare pull diagnostics only for supporting clients.
             workspace =
                 WorkspaceCapabilities(
                     workspaceFolders =

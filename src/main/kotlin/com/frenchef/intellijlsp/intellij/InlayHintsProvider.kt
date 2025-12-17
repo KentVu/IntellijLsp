@@ -1,5 +1,6 @@
 package com.frenchef.intellijlsp.intellij
 
+import com.frenchef.intellijlsp.language.LanguageHandlerRegistry
 import com.frenchef.intellijlsp.protocol.models.InlayHint
 import com.frenchef.intellijlsp.protocol.models.InlayHintKinds
 import com.frenchef.intellijlsp.protocol.models.Position
@@ -9,14 +10,13 @@ import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.project.Project
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiFile
-import com.intellij.psi.PsiNameIdentifierOwner
 import com.intellij.psi.util.PsiTreeUtil
-import org.jetbrains.uast.*
 
 /**
- * Inlay Hints implemented with UAST.
+ * Inlay Hints provider.
  *
- * Provides unified type inference and parameter name hints across Java and Kotlin.
+ * Supports multiple languages through the LanguageHandler abstraction.
+ * Provides full functionality (parameter names and type hints) for JVM languages and safely degrades for others.
  */
 class InlayHintsProvider(private val project: Project) {
     private val log = logger<InlayHintsProvider>()
@@ -29,17 +29,32 @@ class InlayHintsProvider(private val project: Project) {
     fun getInlayHints(psiFile: PsiFile, range: Range): List<InlayHint> {
         return ReadAction.compute<List<InlayHint>, RuntimeException> {
             try {
-                val document =
-                    PsiDocumentManager.getInstance(project).getDocument(psiFile)
-                        ?: return@compute emptyList()
+                val document = PsiDocumentManager.getInstance(project).getDocument(psiFile)
+                    ?: return@compute emptyList()
 
                 val startOffset = PsiMapper.positionToOffset(document, range.start)
                 val endOffset = PsiMapper.positionToOffset(document, range.end)
 
+                val handler = LanguageHandlerRegistry.getHandler(psiFile)
                 val hints = mutableListOf<InlayHint>()
 
-                // Traverse PSI elements in the range and convert them to UAST.
-                collectHintsFromPsi(psiFile, startOffset, endOffset, document, hints)
+                // 1. Collect parameter name hints.
+                PsiTreeUtil.collectElements(psiFile) { element ->
+                    val elRange = element.textRange
+                    elRange != null && elRange.startOffset >= startOffset && elRange.endOffset <= endOffset
+                }.forEach { element ->
+                    if (hints.size >= MAX_HINTS) return@forEach
+
+                    val callExpression = handler.findContainingCallExpression(element)
+                    if (callExpression != null && callExpression.psiElement == element) {
+                        collectParameterHints(handler, callExpression, document, hints)
+                    }
+                }
+
+                // 2. Collect type hints.
+                if (hints.size < MAX_HINTS) {
+                    collectTypeHints(handler, psiFile, startOffset, endOffset, document, hints)
+                }
 
                 log.info("Found ${hints.size} inlay hints")
                 hints.take(MAX_HINTS)
@@ -50,71 +65,27 @@ class InlayHintsProvider(private val project: Project) {
         }
     }
 
-    /** Collects Inlay Hints from PSI and processes them uniformly with UAST. */
-    private fun collectHintsFromPsi(
-        psiFile: PsiFile,
-        startOffset: Int,
-        endOffset: Int,
-        document: com.intellij.openapi.editor.Document,
-        hints: MutableList<InlayHint>
-    ) {
-        // Collect parameter name hints for method calls.
-        PsiTreeUtil.collectElements(psiFile) { element ->
-            val range = element.textRange
-            range != null && range.startOffset >= startOffset && range.endOffset <= endOffset
-        }
-            .forEach { element ->
-                if (hints.size >= MAX_HINTS) return@forEach
-
-                // Convert with UAST.
-                when (val uElement = element.toUElement()) {
-                    is UCallExpression -> collectParameterHints(uElement, document, hints)
-                    is UVariable -> {
-                        if (shouldShowTypeHint(uElement)) {
-                            collectTypeHint(uElement, document, hints)
-                        }
-                    }
-                }
-            }
-    }
-
-    /** Checks whether a type hint should be shown. */
-    private fun shouldShowTypeHint(node: UVariable): Boolean {
-        // Show a type hint for variables with an initializer.
-        return node.uastInitializer != null
-    }
-
     /** Collects parameter name hints. */
     private fun collectParameterHints(
-        call: UCallExpression,
+        handler: com.frenchef.intellijlsp.language.LanguageHandler,
+        callExpression: com.frenchef.intellijlsp.language.CallExpressionInfo,
         document: com.intellij.openapi.editor.Document,
         hints: MutableList<InlayHint>
     ) {
-        val method = call.resolve() ?: return
-        val uMethod = method.toUElement() as? UMethod ?: return
-        val parameters = uMethod.uastParameters
-        val arguments = call.valueArguments
+        val args = handler.getCallArgumentsInfo(callExpression)
 
-        for ((index, arg) in arguments.withIndex()) {
-            if (index >= parameters.size) break
+        for (arg in args) {
             if (hints.size >= MAX_HINTS) break
+            if (arg.isNamed) continue // Skip named arguments.
 
-            val param = parameters[index]
-            val paramName = param.name ?: continue
-
-            // Skip named arguments.
-            if (isNamedArgument(arg)) continue
-
-            val argPsi = arg.sourcePsi ?: continue
-            val argOffset = argPsi.textRange?.startOffset ?: continue
-
+            val argOffset = arg.psiElement.textRange?.startOffset ?: continue
             val line = document.getLineNumber(argOffset)
             val char = argOffset - document.getLineStartOffset(line)
 
             hints.add(
                 InlayHint(
                     position = Position(line = line, character = char),
-                    label = "$paramName:",
+                    label = "${arg.parameterName}:",
                     kind = InlayHintKinds.PARAMETER,
                     paddingLeft = false,
                     paddingRight = true
@@ -123,49 +94,33 @@ class InlayHintsProvider(private val project: Project) {
         }
     }
 
-    /** Checks whether this is a named argument. */
-    private fun isNamedArgument(arg: UExpression): Boolean {
-        // Simplified implementation: check whether the source PSI contains an identifier before "=".
-        val sourcePsi = arg.sourcePsi ?: return false
-        val text = sourcePsi.text
-        return text.contains("=") && !text.startsWith("=")
-    }
-
     /** Collects type hints. */
-    private fun collectTypeHint(
-        variable: UVariable,
+    private fun collectTypeHints(
+        handler: com.frenchef.intellijlsp.language.LanguageHandler,
+        psiFile: PsiFile,
+        startOffset: Int,
+        endOffset: Int,
         document: com.intellij.openapi.editor.Document,
         hints: MutableList<InlayHint>
     ) {
-        val sourcePsi = variable.sourcePsi ?: return
-        val nameIdentifier = (sourcePsi as? PsiNameIdentifierOwner)?.nameIdentifier ?: return
-        val endOffset = nameIdentifier.textRange?.endOffset ?: return
+        val variables = handler.getVariablesNeedingTypeHints(psiFile, startOffset, endOffset)
 
-        val type = variable.type
-        val typeText = type.presentableText
+        for (variable in variables) {
+            if (hints.size >= MAX_HINTS) break
+            if (variable.hasExplicitType) continue // Skip variables with explicit types.
 
-        // Skip explicit type declarations.
-        if (hasExplicitType(variable)) return
+            val line = document.getLineNumber(variable.insertOffset)
+            val char = variable.insertOffset - document.getLineStartOffset(line)
 
-        val line = document.getLineNumber(endOffset)
-        val char = endOffset - document.getLineStartOffset(line)
-
-        hints.add(
-            InlayHint(
-                position = Position(line = line, character = char),
-                label = ": $typeText",
-                kind = InlayHintKinds.TYPE,
-                paddingLeft = false,
-                paddingRight = true
+            hints.add(
+                InlayHint(
+                    position = Position(line = line, character = char),
+                    label = ": ${variable.typeText}",
+                    kind = InlayHintKinds.TYPE,
+                    paddingLeft = false,
+                    paddingRight = true
+                )
             )
-        )
-    }
-
-    /** Checks whether the variable has an explicit type declaration. */
-    private fun hasExplicitType(variable: UVariable): Boolean {
-        val sourcePsi = variable.sourcePsi ?: return true
-        val text = sourcePsi.text
-        // Simplified check: look for type declaration syntax in the source.
-        return text.contains(":") && !text.startsWith(":")
+        }
     }
 }

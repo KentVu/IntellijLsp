@@ -1,5 +1,6 @@
 package com.frenchef.intellijlsp.intellij
 
+import com.frenchef.intellijlsp.language.LanguageHandlerRegistry
 import com.frenchef.intellijlsp.protocol.models.*
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.logger
@@ -7,42 +8,34 @@ import com.intellij.openapi.project.Project
 import com.intellij.psi.*
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.search.searches.ReferencesSearch
-import org.jetbrains.uast.UClass
-import org.jetbrains.uast.UDeclaration
-import org.jetbrains.uast.toUElement
 
 /**
  * Phase 10: Rename Refactoring Provider (T010)
  *
- * IntelliJ integration for LSP rename. Uses ReferencesSearch to find references and generate a WorkspaceEdit.
+ * IntelliJ integration for LSP rename.
+ * Supports multiple languages through the LanguageHandler abstraction.
  */
 class RenameProvider(private val project: Project) {
     private val log = logger<RenameProvider>()
 
     /**
      * Prepares for a rename by checking whether the symbol can be renamed.
-     *
-     * @return PrepareRenameResult containing the range and placeholder, or null if the symbol cannot be renamed.
      */
     fun prepareRename(file: PsiFile, position: Position): PrepareRenameResult? =
         ReadAction.compute<PrepareRenameResult?, RuntimeException> {
             try {
-                val document =
-                    PsiDocumentManager.getInstance(project).getDocument(file)
-                        ?: return@compute null
+                val document = PsiDocumentManager.getInstance(project).getDocument(file)
+                    ?: return@compute null
                 val offset = document.getLineStartOffset(position.line) + position.character
 
-                // Find the element at the position.
                 val element = file.findElementAt(offset) ?: return@compute null
-                val namedElement = findNamedElement(element) ?: return@compute null
+                val namedElement = findNamedElement(file, element) ?: return@compute null
 
-                // Check whether it can be renamed.
                 if (!isRenameable(namedElement)) {
                     log.debug("Element is not renameable: ${namedElement.javaClass.simpleName}")
                     return@compute null
                 }
 
-                // Get the name and range.
                 val name = getElementName(namedElement) ?: return@compute null
                 val nameRange = getNameRange(namedElement, document) ?: return@compute null
 
@@ -56,68 +49,54 @@ class RenameProvider(private val project: Project) {
 
     /**
      * Performs the rename and generates a WorkspaceEdit.
-     *
-     * @return WorkspaceEdit containing all locations to change, or null on failure.
      */
     fun rename(file: PsiFile, position: Position, newName: String): RenameResult? =
         ReadAction.compute<RenameResult?, RuntimeException> {
             try {
-                val document =
-                    PsiDocumentManager.getInstance(project).getDocument(file)
-                        ?: return@compute null
+                val document = PsiDocumentManager.getInstance(project).getDocument(file)
+                    ?: return@compute null
                 val offset = document.getLineStartOffset(position.line) + position.character
 
-                // Find the element at the position.
                 val element = file.findElementAt(offset) ?: return@compute null
-                val namedElement = findNamedElement(element) ?: return@compute null
+                val namedElement = findNamedElement(file, element) ?: return@compute null
 
-                // Check whether it can be renamed.
                 if (!isRenameable(namedElement)) {
                     return@compute RenameResult.Error("Element is not renameable")
                 }
 
-                // Check for conflicts.
-                val conflict = checkConflicts(namedElement, newName)
+                val conflict = checkConflicts(file, namedElement, newName)
                 if (conflict != null) {
                     return@compute RenameResult.Error(conflict)
                 }
 
-                // Collect all reference locations.
                 val edits = mutableMapOf<String, MutableList<TextEdit>>()
 
                 // 1. Add a change for the declaration.
                 val declRange = getNameRange(namedElement, document)
                 if (declRange != null) {
-                    val uri =
-                        file.virtualFile?.url?.replace("file://", "file:///")
-                            ?: return@compute null
+                    val uri = file.virtualFile?.url?.replace("file://", "file:///")
+                        ?: return@compute null
                     edits.getOrPut(uri) { mutableListOf() }.add(TextEdit(declRange, newName))
                 }
 
-                // 2. Find all references and add changes for them.
+                // 2. Find all references and add changes for them (generic PSI API).
                 val scope = GlobalSearchScope.projectScope(project)
                 val references = ReferencesSearch.search(namedElement, scope).findAll()
 
                 for (reference in references) {
                     val refElement = reference.element
                     val refFile = refElement.containingFile ?: continue
-                    val refDoc =
-                        PsiDocumentManager.getInstance(project).getDocument(refFile)
-                            ?: continue
-                    val refUri =
-                        refFile.virtualFile?.url?.replace("file://", "file:///") ?: continue
+                    val refDoc = PsiDocumentManager.getInstance(project).getDocument(refFile)
+                        ?: continue
+                    val refUri = refFile.virtualFile?.url?.replace("file://", "file:///") ?: continue
 
                     val refRange = getElementRange(refElement, refDoc)
                     if (refRange != null) {
-                        edits
-                            .getOrPut(refUri) { mutableListOf() }
-                            .add(TextEdit(refRange, newName))
+                        edits.getOrPut(refUri) { mutableListOf() }.add(TextEdit(refRange, newName))
                     }
                 }
 
-                log.info(
-                    "rename: generated ${edits.values.sumOf { it.size }} edits across ${edits.size} files"
-                )
+                log.info("rename: generated ${edits.values.sumOf { it.size }} edits across ${edits.size} files")
                 RenameResult.Success(WorkspaceEdit(changes = edits))
             } catch (e: Exception) {
                 log.error("Error in rename", e)
@@ -125,16 +104,35 @@ class RenameProvider(private val project: Project) {
             }
         }
 
-    /** Finds the parent named element (PsiNamedElement). */
-    private fun findNamedElement(element: PsiElement): PsiElement? {
+    /** Finds the parent named element using LanguageHandler. */
+    private fun findNamedElement(file: PsiFile, element: PsiElement): PsiElement? {
+        val handler = LanguageHandlerRegistry.getHandler(file)
+
+        // Try to find a function or class with LanguageHandler.
+        val functionInfo = handler.findContainingFunction(element)
+        if (functionInfo != null && functionInfo.nameIdentifier != null) {
+            // Check whether the position is on the name.
+            val nameElement = functionInfo.nameIdentifier
+            if (element.textRange != null && nameElement.textRange != null &&
+                nameElement.textRange.contains(element.textRange.startOffset)
+            ) {
+                return functionInfo.psiElement
+            }
+        }
+
+        val classInfo = handler.findContainingClass(element)
+        if (classInfo != null && classInfo.nameIdentifier != null) {
+            val nameElement = classInfo.nameIdentifier
+            if (element.textRange != null && nameElement.textRange != null &&
+                nameElement.textRange.contains(element.textRange.startOffset)
+            ) {
+                return classInfo.psiElement
+            }
+        }
+
+        // Fall back to searching for a generic PsiNamedElement.
         var current: PsiElement? = element
         while (current != null) {
-            // Try to get a unified representation with UAST.
-            val uElement = current.toUElement()
-            if (uElement is UDeclaration) {
-                return current
-            }
-            // Fall back to PsiNamedElement.
             if (current is PsiNamedElement && current.name != null) {
                 return current
             }
@@ -145,16 +143,13 @@ class RenameProvider(private val project: Project) {
 
     /** Checks whether the element can be renamed. */
     private fun isRenameable(element: PsiElement): Boolean {
-        // Must be a named element.
         if (element !is PsiNamedElement) return false
 
-        // Must be writable (not from an external library).
         if (!element.isWritable) {
             log.debug("Element is not writable (external library)")
             return false
         }
 
-        // Check whether it comes from a library.
         val virtualFile = element.containingFile?.virtualFile
         if (virtualFile != null) {
             val scope = GlobalSearchScope.projectScope(project)
@@ -167,22 +162,23 @@ class RenameProvider(private val project: Project) {
         return true
     }
 
-    /** Checks for rename conflicts using UAST (supports Java and Kotlin). */
-    private fun checkConflicts(element: PsiElement, newName: String): String? {
-        // Use UAST to find the containing class.
-        val uClass = element.parent?.toUElement() as? UClass
-        val psiClass = uClass?.javaPsi ?: (element.parent as? PsiClass)
+    /** Checks for rename conflicts using LanguageHandler. */
+    private fun checkConflicts(file: PsiFile, element: PsiElement, newName: String): String? {
+        val handler = LanguageHandlerRegistry.getHandler(file)
+        val classInfo = handler.findContainingClass(element)
 
-        if (psiClass != null) {
-            // Check for conflicts with class members.
-            for (member in psiClass.allMethods) {
-                if (member.name == newName && member != element) {
-                    return "A method named '$newName' already exists in this class"
+        if (classInfo != null) {
+            val psiClass = classInfo.psiElement as? PsiClass
+            if (psiClass != null) {
+                for (member in psiClass.allMethods) {
+                    if (member.name == newName && member != element) {
+                        return "A method named '$newName' already exists in this class"
+                    }
                 }
-            }
-            for (field in psiClass.allFields) {
-                if (field.name == newName && field != element) {
-                    return "A field named '$newName' already exists in this class"
+                for (field in psiClass.allFields) {
+                    if (field.name == newName && field != element) {
+                        return "A field named '$newName' already exists in this class"
+                    }
                 }
             }
         }
@@ -202,11 +198,10 @@ class RenameProvider(private val project: Project) {
         element: PsiElement,
         document: com.intellij.openapi.editor.Document
     ): Range? {
-        val nameIdentifier =
-            when (element) {
-                is PsiNameIdentifierOwner -> element.nameIdentifier
-                else -> null
-            }
+        val nameIdentifier = when (element) {
+            is PsiNameIdentifierOwner -> element.nameIdentifier
+            else -> null
+        }
 
         val targetElement = nameIdentifier ?: element
         return getElementRange(targetElement, document)
