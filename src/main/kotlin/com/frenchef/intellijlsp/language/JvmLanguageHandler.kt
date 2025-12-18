@@ -175,9 +175,9 @@ class JvmLanguageHandler : LanguageHandler {
             val paramName = param.name ?: continue
             val argPsi = arg.sourcePsi ?: continue
 
-            // Simplified named-argument detection.
-            val argText = argPsi.text
-            val isNamed = argText.contains("=") && !argText.startsWith("=")
+            // Use UAST to check for named arguments.
+            // UNamedExpression represents Kotlin named argument syntax (paramName = value).
+            val isNamed = arg is UNamedExpression
 
             results.add(
                 ArgumentInfo(
@@ -241,33 +241,95 @@ class JvmLanguageHandler : LanguageHandler {
         return results
     }
 
+    override fun getCallExpressionsInRange(file: PsiFile, startOffset: Int, endOffset: Int): List<CallExpressionInfo> {
+        val results = mutableListOf<CallExpressionInfo>()
+
+        val uFile = file.toUElement()
+        if (uFile == null) {
+            log.debug("Cannot convert file to UAST: ${file.name}")
+            return results
+        }
+
+        // Access UAST call expressions directly to avoid O(N * parent-walk).
+        uFile.accept(object : AbstractUastVisitor() {
+            override fun visitCallExpression(node: UCallExpression): Boolean {
+                val sourcePsi = node.sourcePsi ?: return false
+                val range = sourcePsi.textRange ?: return false
+
+                // Check whether it is within the specified range.
+                if (range.startOffset >= startOffset && range.endOffset <= endOffset) {
+                    val resolved = node.resolve()
+                    results.add(
+                        CallExpressionInfo(
+                            psiElement = sourcePsi,
+                            methodName = node.methodName ?: "<unknown>",
+                            resolvedTarget = resolved?.let { psiMethodToFunctionInfo(it) }
+                        )
+                    )
+                }
+                return false // Continue traversal.
+            }
+        })
+
+        return results
+    }
+
     /** Checks whether the variable has an explicit type declaration. */
     private fun hasExplicitType(variable: UVariable): Boolean {
         val sourcePsi = variable.sourcePsi ?: return true
-        val text = sourcePsi.text
-        // Simplified check: look for type declaration syntax in the source.
-        return text.contains(":") && !text.startsWith(":")
+
+        // Java: Most local variables have explicit types (except `var`).
+        if (sourcePsi is PsiVariable) {
+            val typeText = sourcePsi.typeElement?.text?.trim()
+            return !typeText.isNullOrBlank() && typeText != "var"
+        }
+
+        // Kotlin/Scala commonly use `name: Type`; use the variable name for a more reliable heuristic.
+        val name = variable.name
+        if (!name.isNullOrBlank()) {
+            val pattern = Regex("\\b${Regex.escape(name)}\\s*:")
+            if (pattern.containsMatchIn(sourcePsi.text)) {
+                return true
+            }
+        }
+
+        return false
     }
 
     // ============ Conversion helper methods ============
 
     private fun uMethodToFunctionInfo(uMethod: UMethod): FunctionInfo {
+        // Prefer sourcePsi (the original source element) to avoid Kotlin light element positioning issues.
+        // javaPsi may be a light element for Kotlin, resulting in incorrect containingFile/textRange values.
+        val sourcePsi = uMethod.sourcePsi
         val javaPsi = uMethod.javaPsi
+
+        // Use sourcePsi as the primary element when available to ensure accurate positioning.
+        val psiElement = sourcePsi ?: javaPsi
+
         return FunctionInfo(
-            psiElement = javaPsi,
+            psiElement = psiElement,
             name = javaPsi.name,
             containingClass = javaPsi.containingClass?.let { psiClassToClassInfo(it) },
-            nameIdentifier = javaPsi.nameIdentifier,
+            // Prefer getting the name identifier from sourcePsi.
+            nameIdentifier = (sourcePsi as? PsiNameIdentifierOwner)?.nameIdentifier
+                ?: javaPsi.nameIdentifier,
             isConstructor = javaPsi.isConstructor
         )
     }
 
     private fun psiMethodToFunctionInfo(psiMethod: PsiMethod): FunctionInfo {
+        // Prefer navigationElement to get the element in the source file.
+        // This avoids positioning issues caused by Kotlin light methods.
+        val navElement = psiMethod.navigationElement
+        val sourceElement = if (navElement !== psiMethod && navElement != null) navElement else psiMethod
+
         return FunctionInfo(
-            psiElement = psiMethod,
+            psiElement = sourceElement,
             name = psiMethod.name,
             containingClass = psiMethod.containingClass?.let { psiClassToClassInfo(it) },
-            nameIdentifier = psiMethod.nameIdentifier,
+            nameIdentifier = (sourceElement as? PsiNameIdentifierOwner)?.nameIdentifier
+                ?: psiMethod.nameIdentifier,
             isConstructor = psiMethod.isConstructor
         )
     }

@@ -128,15 +128,6 @@ class LspServerStartupActivity : ProjectActivity {
             // Store diagnostics handler in project service for access by other handlers
             projectService.setDiagnosticsHandler(diagnosticsHandler)
 
-            // Register the DocumentDiagnostic handler (LSP 3.17 pull diagnostics).
-            val documentDiagnosticHandler =
-                com.frenchef.intellijlsp.handlers.DocumentDiagnosticHandler(
-                    project,
-                    jsonRpcHandler,
-                    documentManager
-                )
-            documentDiagnosticHandler.register()
-
             // Register the typeDefinition handler (abcoder compatibility).
             val typeDefinitionHandler =
                 com.frenchef.intellijlsp.handlers.TypeDefinitionHandler(
@@ -146,16 +137,22 @@ class LspServerStartupActivity : ProjectActivity {
                 )
             typeDefinitionHandler.register()
 
-            // Register the documentSymbol handler (abcoder compatibility)
-            val documentSymbolHandler = com.frenchef.intellijlsp.handlers.DocumentSymbolHandler(
-                project, jsonRpcHandler, documentManager
-            )
+            // Register the documentSymbol handler (abcoder compatibility).
+            val documentSymbolHandler =
+                com.frenchef.intellijlsp.handlers.DocumentSymbolHandler(
+                    project,
+                    jsonRpcHandler,
+                    documentManager
+                )
             documentSymbolHandler.register()
 
-            // Register the semanticTokens handler (abcoder compatibility)
-            val semanticTokensHandler = com.frenchef.intellijlsp.handlers.SemanticTokensHandler(
-                project, jsonRpcHandler, documentManager
-            )
+            // Register the semanticTokens handler (abcoder compatibility).
+            val semanticTokensHandler =
+                com.frenchef.intellijlsp.handlers.SemanticTokensHandler(
+                    project,
+                    jsonRpcHandler,
+                    documentManager
+                )
             semanticTokensHandler.register()
 
             // Phase 9: Register signatureHelp handler

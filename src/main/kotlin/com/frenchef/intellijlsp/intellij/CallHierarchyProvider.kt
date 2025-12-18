@@ -10,7 +10,6 @@ import com.intellij.openapi.project.Project
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFile
-import com.intellij.psi.PsiManager
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.search.searches.ReferencesSearch
 
@@ -99,12 +98,14 @@ class CallHierarchyProvider(private val project: Project) {
 
                 log.debug("getIncomingCalls: found ${references.size} references for function ${functionInfo.name}")
 
-                val handler = LanguageHandlerRegistry.getHandler(functionInfo.psiElement.containingFile!!)
-
                 for (reference in references) {
                     if (results.size >= MAX_RESULTS) break
 
                     val refElement = reference.element
+                    val refFile = refElement.containingFile ?: continue
+
+                    // Use the handler for the file containing the reference, not the referenced target.
+                    val handler = LanguageHandlerRegistry.getHandler(refFile)
 
                     // Use LanguageHandler to find the method containing the element.
                     val callerFunction = handler.findContainingFunction(refElement)
@@ -198,39 +199,24 @@ class CallHierarchyProvider(private val project: Project) {
     private fun findFunctionByItem(item: CallHierarchyItem): FunctionInfo? {
         LspLogger.debug(TAG, "findFunctionByItem: uri=${item.uri}, name=${item.name}")
 
-        val url = item.uri
-        LspLogger.debug(TAG, "findFunctionByItem: looking for file at url=$url")
-
-        val virtualFile = com.intellij.openapi.vfs.VirtualFileManager.getInstance()
-            .findFileByUrl(url)
-        if (virtualFile == null) {
-            LspLogger.warn(TAG, "findFunctionByItem: virtualFile is null for url=$url")
+        // Use the shared URI parser to handle differences in case and encoding.
+        val resolved = LspDecompiledUriResolver.resolveForRequest(project, item.uri)
+        if (resolved == null) {
+            LspLogger.warn(TAG, "findFunctionByItem: failed to parse URI ${item.uri}")
             return null
         }
 
-        val psiFile = PsiManager.getInstance(project).findFile(virtualFile)
-        if (psiFile == null) {
-            LspLogger.warn(TAG, "findFunctionByItem: psiFile is null")
-            return null
-        }
-
-        val document = PsiDocumentManager.getInstance(project).getDocument(psiFile)
-        if (document == null) {
-            LspLogger.warn(TAG, "findFunctionByItem: document is null")
-            return null
-        }
-
-        val offset = document.getLineStartOffset(item.selectionRange.start.line) +
-                item.selectionRange.start.character
+        // Calculate the offset from fileText to match the client's Position.
+        val offset = PsiMapper.positionToOffset(resolved.fileText, item.selectionRange.start)
         LspLogger.debug(TAG, "findFunctionByItem: offset=$offset, line=${item.selectionRange.start.line}")
 
-        val element = psiFile.findElementAt(offset)
+        val element = resolved.analysisPsiFile.findElementAt(offset)
         if (element == null) {
             LspLogger.warn(TAG, "findFunctionByItem: element is null at offset $offset")
             return null
         }
 
-        val handler = LanguageHandlerRegistry.getHandler(psiFile)
+        val handler = LanguageHandlerRegistry.getHandler(resolved.analysisPsiFile)
         val functionInfo = handler.findContainingFunction(element)
         if (functionInfo == null) {
             LspLogger.warn(TAG, "findFunctionByItem: function not found")

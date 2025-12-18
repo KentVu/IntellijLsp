@@ -9,7 +9,6 @@ import com.frenchef.intellijlsp.protocol.models.PublishDiagnosticsParams
 import com.frenchef.intellijlsp.server.LspServer
 import com.frenchef.intellijlsp.server.TcpLspServer
 import com.frenchef.intellijlsp.server.UdsLspServer
-import com.frenchef.intellijlsp.services.LspProjectService
 import com.frenchef.intellijlsp.util.LspLogger
 import com.intellij.codeInsight.daemon.DaemonCodeAnalyzer
 import com.intellij.openapi.application.ApplicationManager
@@ -23,7 +22,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Handles publishing diagnostics to LSP clients.
- * 
+ *
  * Retrieves diagnostics using three strategies:
  * 1. BackgroundAnalyzer - Opens the file in an editor to trigger DaemonCodeAnalyzer.
  * 2. MarkupModel (DiagnosticsProvider) - Fast, but requires the file to be open in an editor.
@@ -46,10 +45,6 @@ class DiagnosticsHandler(
     
     // Track pending diagnostic updates per file to debounce
     private val pendingUpdates = ConcurrentHashMap<String, Job>()
-
-    private fun isPushDiagnosticsEnabled(): Boolean {
-        return !project.getService(LspProjectService::class.java).isUsePullDiagnostics()
-    }
 
     /**
      * Start listening for diagnostic updates.
@@ -77,12 +72,12 @@ class DiagnosticsHandler(
     /**
      * Publish diagnostics for a specific file.
      * Uses BackgroundAnalyzer + MarkupModel + Inspection API approaches.
+     *
+     * Note: Even when pull mode is enabled, analysis must still run to keep the file open and update MarkupModel.
+     * Check whether push mode is enabled only when broadcasting diagnostics.
      */
     fun publishDiagnosticsForFile(uri: String) {
-        if (!isPushDiagnosticsEnabled()) {
-            LspLogger.debug("Diagnostics", "Pull diagnostics enabled; suppressing publishDiagnostics for $uri")
-            return
-        }
+
         // Cancel any pending update for this file
         pendingUpdates[uri]?.cancel()
         
@@ -221,9 +216,6 @@ class DiagnosticsHandler(
      * Clear diagnostics for a file.
      */
     fun clearDiagnosticsForFile(uri: String) {
-        if (!isPushDiagnosticsEnabled()) {
-            return
-        }
         pendingUpdates[uri]?.cancel()
         pendingUpdates.remove(uri)
         
@@ -241,9 +233,6 @@ class DiagnosticsHandler(
      * Broadcast diagnostics to all connected clients.
      */
     private fun broadcastDiagnostics(params: PublishDiagnosticsParams) {
-        if (!isPushDiagnosticsEnabled()) {
-            return
-        }
         try {
             val gson = com.frenchef.intellijlsp.protocol.LspGson.instance
             when (server) {

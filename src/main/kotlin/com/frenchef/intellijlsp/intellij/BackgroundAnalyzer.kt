@@ -10,6 +10,7 @@ import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.PsiManager
@@ -27,7 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 
  * Core strategy:
  * 1. If the file is already open in an editor, call DaemonCodeAnalyzer.restart() directly.
- * 2. Otherwise, open the file in the background, trigger analysis, and close it afterward.
+ * 2. Otherwise, open the file in the background and trigger analysis.
  * 
  * Note: This class must access FileEditorManager on the EDT (Event Dispatch Thread).
  */
@@ -77,7 +78,7 @@ class BackgroundAnalyzer(private val project: Project) {
         val state = analyzingFiles.getOrPut(uri) { AnalysisState() }
 
         try {
-            // Open the file on the EDT.
+            // Open the file asynchronously on the EDT (invokeLater does not block the calling thread).
             ApplicationManager.getApplication().invokeLater {
                 try {
                     if (project.isDisposed) return@invokeLater
@@ -97,12 +98,13 @@ class BackgroundAnalyzer(private val project: Project) {
                         // Trigger analysis.
                         triggerAnalysis(virtualFile, uri)
 
-                        // Schedule the editor to close if we opened it.
-                        scheduleEditorClose(virtualFile, uri, state)
+                        // Keep the editor open so diagnostics can access MarkupModel.
                     } else {
                         LspLogger.warn(TAG, "Could not open file editor: $uri")
                     }
 
+                } catch (e: ProcessCanceledException) {
+                    throw e
                 } catch (e: Exception) {
                     LspLogger.error(TAG, "Error opening file: $uri - ${e.message}")
                 } finally {
@@ -111,6 +113,8 @@ class BackgroundAnalyzer(private val project: Project) {
             }
 
             return true
+        } catch (e: ProcessCanceledException) {
+            throw e
         } catch (e: Exception) {
             log.warn("Error ensuring file open for analysis: $uri", e)
             return false
@@ -118,9 +122,10 @@ class BackgroundAnalyzer(private val project: Project) {
     }
 
     /**
-     * Triggers code analysis for the file.
+     * Triggers code analysis for the file asynchronously.
      */
     private fun triggerAnalysis(virtualFile: VirtualFile, uri: String) {
+        // Trigger asynchronously with invokeLater to avoid blocking.
         ApplicationManager.getApplication().invokeLater {
             try {
                 if (project.isDisposed) return@invokeLater
@@ -129,9 +134,13 @@ class BackgroundAnalyzer(private val project: Project) {
                     val psiFile = PsiManager.getInstance(project).findFile(virtualFile)
                     if (psiFile != null) {
                         DaemonCodeAnalyzer.getInstance(project).restart(psiFile)
-                        LspLogger.debug(TAG, "Triggered DaemonCodeAnalyzer.restart(): $uri")
+                        LspLogger.info(TAG, "Triggered DaemonCodeAnalyzer.restart(): $uri")
+                    } else {
+                        LspLogger.warn(TAG, "Could not find PsiFile: $uri")
                     }
                 }
+            } catch (e: ProcessCanceledException) {
+                throw e
             } catch (e: Exception) {
                 LspLogger.error(TAG, "Error triggering analysis: $uri - ${e.message}")
             }

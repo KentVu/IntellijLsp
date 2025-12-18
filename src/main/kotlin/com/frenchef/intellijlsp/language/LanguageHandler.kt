@@ -43,6 +43,12 @@ interface LanguageHandler {
 
     /** Gets variables that need type hints (for Inlay Hints). */
     fun getVariablesNeedingTypeHints(file: PsiFile, startOffset: Int, endOffset: Int): List<VariableTypeHintInfo>
+
+    /** Gets all call expressions in the specified range (for efficient Inlay Hints collection). */
+    fun getCallExpressionsInRange(file: PsiFile, startOffset: Int, endOffset: Int): List<CallExpressionInfo> {
+        // Default implementation returns an empty list; language handlers should override this for efficiency.
+        return emptyList()
+    }
 }
 
 /**

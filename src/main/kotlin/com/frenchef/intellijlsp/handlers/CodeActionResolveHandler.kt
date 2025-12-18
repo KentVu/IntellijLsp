@@ -19,6 +19,7 @@ import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.EditorFactory
+import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiFile
@@ -64,9 +65,14 @@ class CodeActionResolveHandler(
                 return gson.toJsonTree(codeAction)
             }
 
-            log.info("Resolving CodeAction: ${codeAction.title} for ${data.uri}")
+            val normalizedUri = com.frenchef.intellijlsp.util.LspUriUtil.normalize(data.uri)
+            if (normalizedUri != data.uri) {
+                log.info("CodeAction/resolve uri normalize: ${data.uri} -> $normalizedUri")
+            }
 
-            val resolvedAction = resolveCodeAction(codeAction, data)
+            log.info("Resolving CodeAction: ${codeAction.title} for $normalizedUri")
+
+            val resolvedAction = resolveCodeAction(codeAction, data.copy(uri = normalizedUri))
             gson.toJsonTree(resolvedAction)
         } catch (e: Exception) {
             log.error("Error resolving code action", e)
@@ -101,8 +107,8 @@ class CodeActionResolveHandler(
                 ?: return codeAction
 
         // 2. Find and apply the corresponding action based on actionType.
-        // Note: resolveQuickFix and resolveIntention handle EDT/ReadContext internally,
-        // so do not wrap this in ReadAction or it may deadlock (invokeAndWait from ReadAction).
+        // resolveQuickFix and resolveIntention handle EDT/ReadContext internally, so do not wrap this
+        // in ReadAction or it may deadlock (invokeAndWait from ReadAction).
         val edit =
             when (data.actionType) {
                 "quickfix" -> resolveQuickFix(psiFile, document, data)
@@ -198,10 +204,23 @@ class CodeActionResolveHandler(
 
                     val intentionManager = IntentionManager.getInstance()
 
-                    // Find the matching intention.
+                    // Incompatible intention class prefixes (these require a visible editor).
+                    val incompatibleClassPrefixes = listOf(
+                        "com.intellij.ml.llm",           // AI Assistant
+                        "com.intellij.ai",               // AI features
+                        "com.jetbrains.rider"            // Rider specific
+                    )
+
+                    // Find the matching intention and filter out incompatible types.
                     val matchingIntention =
                         intentionManager.intentionActions.find { intention ->
                             try {
+                                // Filter out incompatible intentions.
+                                val className = intention.javaClass.name
+                                if (incompatibleClassPrefixes.any { className.startsWith(it) }) {
+                                    return@find false
+                                }
+
                                 intention.isAvailable(project, tempEditor, psiFile) &&
                                         intention.text == data.actionTitle
                             } catch (_: Exception) {
@@ -212,8 +231,13 @@ class CodeActionResolveHandler(
                     if (matchingIntention == null) {
                         log.warn("Intention not found: ${data.actionTitle}")
                     } else {
-                        // Apply the action on the EDT.
-                        result = applyActionAndGetEdit(psiFile, document, matchingIntention, data)
+                        // Apply the action on the EDT with error handling.
+                        try {
+                            result = applyActionAndGetEdit(psiFile, document, matchingIntention, data)
+                        } catch (e: AssertionError) {
+                            // Some intentions require a visible editor; ignore these errors.
+                            log.debug("Intention requires visible editor: ${data.actionTitle} - ${e.message}")
+                        }
                     }
                 } finally {
                     if (tempEditor != null && !tempEditor.isDisposed) {
@@ -226,6 +250,12 @@ class CodeActionResolveHandler(
         } catch (e: com.intellij.openapi.progress.ProcessCanceledException) {
             throw e
         } catch (e: Exception) {
+            // Catch the RuntimeException wrapped by invokeAndWait.
+            val cause = e.cause
+            if (cause is AssertionError && cause.message?.contains("Editor must be showing") == true) {
+                log.debug("Intention requires visible editor: ${data.actionTitle}")
+                return null
+            }
             log.error("Error resolving intention", e)
             return null
         }
@@ -314,6 +344,8 @@ class CodeActionResolveHandler(
                         PsiDocumentManager.getInstance(project).doPostponedOperationsAndUnblockDocument(document)
                         document.setText(originalText)
                         PsiDocumentManager.getInstance(project).commitDocument(document)
+                        // Reload from disk to sync VFS, avoid conflict prompt
+                        FileDocumentManager.getInstance().reloadFromDisk(document)
                     } catch (e: Exception) {
                         log.warn("Failed to rollback document text: ${e.message}", e)
                     }
@@ -338,7 +370,7 @@ class CodeActionResolveHandler(
      *
      * Notes:
      * - Many IntelliJ/Kotlin Intentions and QuickFixes depend on real PSI/VirtualFile context;
-     *   invoking them on a PsiFileFactory copy may return successfully without changing the document, leaving resolve without an edit.
+     *   invoking them on a PsiFileFactory copy may return successfully without changing the document.
      * - To reliably generate a WorkspaceEdit, apply the action to the original document, read the modified text, then restore it.
      */
     private fun applyActionAndGetEdit(
@@ -369,12 +401,14 @@ class CodeActionResolveHandler(
                     log.warn("Failed to invoke action: ${e.message}", e)
                 } finally {
                     try {
-                        // Unblock the document to process pending PSI operations.
+                        // Unlock document (handle PSI pending operations)
                         PsiDocumentManager.getInstance(project)
                             .doPostponedOperationsAndUnblockDocument(originalDocument)
-                        // Roll back so the actual file is not changed (LSP resolve only needs the edit).
+                        // Rollback: avoid actual file changes (LSP resolve only needs edit)
                         originalDocument.setText(originalText)
                         PsiDocumentManager.getInstance(project).commitDocument(originalDocument)
+                        // Reload from disk to sync VFS, avoid conflict prompt
+                        FileDocumentManager.getInstance().reloadFromDisk(originalDocument)
                     } catch (e: Exception) {
                         log.warn("Failed to rollback document text: ${e.message}", e)
                     }
@@ -384,7 +418,7 @@ class CodeActionResolveHandler(
             val after = modifiedText ?: return null
             if (after == originalText) return null
 
-            // For robustness, return a single TextEdit replacing the whole file (avoids client rejection due to diff errors).
+            // For robustness, return a single TextEdit replacing the whole file to avoid client rejection from diff errors.
             val textEdits = computeFullDocumentReplaceEdit(originalText, after)
             if (textEdits.isEmpty()) return null
 

@@ -39,15 +39,27 @@ class InlayHintsProvider(private val project: Project) {
                 val hints = mutableListOf<InlayHint>()
 
                 // 1. Collect parameter name hints.
-                PsiTreeUtil.collectElements(psiFile) { element ->
-                    val elRange = element.textRange
-                    elRange != null && elRange.startOffset >= startOffset && elRange.endOffset <= endOffset
-                }.forEach { element ->
-                    if (hints.size >= MAX_HINTS) return@forEach
+                // Optimization: enumerate call expression nodes directly to avoid O(N * parent-walk) complexity.
+                val callExpressions = handler.getCallExpressionsInRange(psiFile, startOffset, endOffset)
 
-                    val callExpression = handler.findContainingCallExpression(element)
-                    if (callExpression != null && callExpression.psiElement == element) {
-                        collectParameterHints(handler, callExpression, document, hints)
+                if (callExpressions.isNotEmpty()) {
+                    // Use the optimized path when the handler provides call expressions in the range.
+                    for (callExpr in callExpressions) {
+                        if (hints.size >= MAX_HINTS) break
+                        collectParameterHints(handler, callExpr, document, hints)
+                    }
+                } else {
+                    // Fall back to traversing PSI elements for handlers that do not implement getCallExpressionsInRange.
+                    PsiTreeUtil.collectElements(psiFile) { element ->
+                        val elRange = element.textRange
+                        elRange != null && elRange.startOffset >= startOffset && elRange.endOffset <= endOffset
+                    }.forEach { element ->
+                        if (hints.size >= MAX_HINTS) return@forEach
+
+                        val callExpression = handler.findContainingCallExpression(element)
+                        if (callExpression != null && callExpression.psiElement == element) {
+                            collectParameterHints(handler, callExpression, document, hints)
+                        }
                     }
                 }
 

@@ -5,7 +5,6 @@ import com.frenchef.intellijlsp.protocol.JsonRpcHandler
 import com.frenchef.intellijlsp.protocol.LspException
 import com.frenchef.intellijlsp.protocol.LspGson
 import com.frenchef.intellijlsp.protocol.models.*
-import com.frenchef.intellijlsp.services.LspProjectService
 import com.google.gson.JsonElement
 import com.google.gson.JsonNull
 import com.intellij.openapi.diagnostic.logger
@@ -27,12 +26,6 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
 
     private var clientCapabilities: ClientCapabilities? = null
 
-    /**
-     * Some client capabilities (e.g. textDocument.diagnostic) are not modeled in our ClientCapabilities yet.
-     * We detect them from the raw initialize params JSON.
-     */
-    @Volatile
-    private var clientSupportsPullDiagnostics: Boolean = false
 
     fun register() {
         jsonRpcHandler.registerRequestHandler("initialize", this::handleInitialize)
@@ -58,18 +51,6 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
         val initParams = gson.fromJson(params, InitializeParams::class.java)
         clientCapabilities = initParams.capabilities
 
-        // Detect LSP 3.17 Pull diagnostics support: capabilities.textDocument.diagnostic
-        clientSupportsPullDiagnostics =
-            try {
-                val capsObj = params.asJsonObject.getAsJsonObject("capabilities")
-                val textDocumentObj = capsObj?.getAsJsonObject("textDocument")
-                textDocumentObj?.has("diagnostic") == true
-            } catch (_: Exception) {
-                false
-            }
-
-        // Store the choice in project-level service so DiagnosticsHandler can suppress Push diagnostics.
-        project.getService(LspProjectService::class.java).setUsePullDiagnostics(clientSupportsPullDiagnostics)
 
         log.info("Client root URI: ${initParams.rootUri}")
         log.info("Client capabilities received")
@@ -106,15 +87,13 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
         // Reset initialization state to allow the client to reconnect.
         initialized = false
         clientCapabilities = null
-        clientSupportsPullDiagnostics = false
-        project.getService(LspProjectService::class.java).setUsePullDiagnostics(false)
-        // Clear the decompilation cache directory.
+        // Clean up the decompilation cache directory.
         DecompileCache.clearCache(project)
         return JsonNull.INSTANCE
     }
 
     /**
-     * Resets the lifecycle state so a new client can initialize.
+     * Resets lifecycle state to allow a new client to initialize.
      * Called when the client disconnects.
      */
     fun reset() {
@@ -122,15 +101,13 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
         initialized = false
         shutdownRequested = false
         clientCapabilities = null
-        clientSupportsPullDiagnostics = false
-        project.getService(LspProjectService::class.java).setUsePullDiagnostics(false)
     }
 
     /** Handle the 'exit' notification. Exits the server. */
     private fun handleExit(params: JsonElement?) {
         log.info("Handling exit notification for project: ${project.name}")
 
-        // Clear the decompilation cache as a safeguard in case shutdown was not called.
+        // Clean up the decompilation cache directory in case shutdown was not called.
         DecompileCache.clearCache(project)
 
         // The exit notification is sent to request the server to exit.
@@ -272,11 +249,8 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
                 InlayHintOptions(resolveProvider = false), // Phase 9: Inlay Hints
             callHierarchyProvider = true, // Phase 10: Call Hierarchy (T012)
             typeHierarchyProvider = true, // Phase 10: Type Hierarchy (T012)
-            diagnosticProvider = DiagnosticOptions(
-                identifier = "intellij-lsp",
-                interFileDependencies = true,
-                workspaceDiagnostics = false
-            ).takeIf { clientSupportsPullDiagnostics }, // LSP 3.17: Declare pull diagnostics only for supporting clients.
+            // Disable Pull diagnostics and use only Push mode (faster; the server pushes updates).
+            diagnosticProvider = null,
             workspace =
                 WorkspaceCapabilities(
                     workspaceFolders =
@@ -288,10 +262,4 @@ class LifecycleHandler(private val project: Project, private val jsonRpcHandler:
             experimental = null
         )
     }
-
-    fun isInitialized(): Boolean = initialized
-
-    fun isShutdownRequested(): Boolean = shutdownRequested
-
-    fun getClientCapabilities(): ClientCapabilities? = clientCapabilities
 }
